@@ -22,10 +22,9 @@ pub enum BackfillSyncState {
     /// This is the initial or default state.
     #[default]
     Idle,
-    /// A backfill action has been sent to the pipeline, but processing has not started yet.
+    /// A backfill synchronization has been requested or planned, but processing has not started
+    /// yet.
     Pending,
-    /// A backfill synchronization must be re-evaluated after persistence catches up.
-    PendingRevalidation,
     /// The node is actively engaged in backfill synchronization.
     Active,
 }
@@ -39,11 +38,6 @@ impl BackfillSyncState {
     /// Returns true if the state is pending.
     pub const fn is_pending(&self) -> bool {
         matches!(self, Self::Pending)
-    }
-
-    /// Returns true if backfill must be re-evaluated before it can start.
-    pub const fn is_pending_revalidation(&self) -> bool {
-        matches!(self, Self::PendingRevalidation)
     }
 
     /// Returns true if the state is active.

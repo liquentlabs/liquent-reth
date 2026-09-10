@@ -9,12 +9,10 @@ use reth_db_api::{
 };
 use reth_etl::Collector;
 use reth_primitives_traits::Account;
-use reth_provider::{
-    AccountExtReader, DBProvider, HashingWriter, StatsReader, StorageSettingsCache,
-};
+use reth_provider::{AccountExtReader, DBProvider, HashingWriter, StatsReader};
 use reth_stages_api::{
-    AccountHashingCheckpoint, BlockRangeOutput, EntitiesCheckpoint, ExecInput, ExecOutput, Stage,
-    StageCheckpoint, StageError, StageId, UnwindInput, UnwindOutput,
+    AccountHashingCheckpoint, EntitiesCheckpoint, ExecInput, ExecOutput, Stage, StageCheckpoint,
+    StageError, StageId, UnwindInput, UnwindOutput,
 };
 use reth_storage_errors::provider::ProviderResult;
 use std::{
@@ -78,7 +76,7 @@ impl AccountHashingStage {
     {
         use alloy_primitives::U256;
         use reth_db_api::models::AccountBeforeTx;
-        use reth_provider::{BlockWriter, StaticFileProviderFactory, StaticFileWriter};
+        use reth_provider::{StaticFileProviderFactory, StaticFileWriter};
         use reth_testing_utils::{
             generators,
             generators::{random_block_range, random_eoa_accounts, BlockRangeParams},
@@ -93,7 +91,7 @@ impl AccountHashingStage {
         );
 
         for block in blocks {
-            provider.insert_block(&block.try_recover().unwrap()).unwrap();
+            provider.insert_historical_block(block.try_recover().unwrap()).unwrap();
         }
         provider
             .static_file_provider()
@@ -142,11 +140,7 @@ impl Default for AccountHashingStage {
 
 impl<Provider> Stage<Provider> for AccountHashingStage
 where
-    Provider: DBProvider<Tx: DbTxMut>
-        + HashingWriter
-        + AccountExtReader
-        + StatsReader
-        + StorageSettingsCache,
+    Provider: DBProvider<Tx: DbTxMut> + HashingWriter + AccountExtReader + StatsReader,
 {
     /// Return the id of the stage
     fn id(&self) -> StageId {
@@ -154,19 +148,9 @@ where
     }
 
     /// Execute the stage.
-    ///
-    /// When `use_hashed_state` is enabled, this stage is a no-op because the execution stage
-    /// writes directly to `HashedAccounts`. Otherwise, it hashes plain state to populate hashed
-    /// tables.
     fn execute(&mut self, provider: &Provider, input: ExecInput) -> Result<ExecOutput, StageError> {
         if input.target_reached() {
             return Ok(ExecOutput::done(input.checkpoint()))
-        }
-
-        // If using hashed state as canonical, execution already writes to `HashedAccounts`,
-        // so this stage becomes a no-op.
-        if provider.cached_storage_settings().use_hashed_state() {
-            return Ok(ExecOutput::done(input.checkpoint().with_block_number(input.target())));
         }
 
         // Use the total remaining range to decide clean vs incremental.
@@ -219,7 +203,7 @@ where
                 if index > 0 && index.is_multiple_of(interval) {
                     info!(
                         target: "sync::stages::hashing_account",
-                        progress = %format_args!("{:.2}%", (index as f64 / total_hashes as f64) * 100.0),
+                        progress = %format!("{:.2}%", (index as f64 / total_hashes as f64) * 100.0),
                         "Inserting hashes"
                     );
                 }
@@ -239,7 +223,7 @@ where
         } else {
             // Stream changesets entry-by-entry, bounded by both block count
             // (commit_threshold) and entry count (commit_entries), whichever comes first.
-            let BlockRangeOutput { block_range, is_final_range } =
+            let (block_range, is_final_range) =
                 input.next_block_range_with_threshold(self.commit_threshold);
             let (from_block, to_block) = block_range.into_inner();
 
@@ -287,11 +271,6 @@ where
         provider: &Provider,
         input: UnwindInput,
     ) -> Result<UnwindOutput, StageError> {
-        // NOTE: this runs in both v1 and v2 mode. In v2 mode, execution writes
-        // directly to `HashedAccounts`, but the unwind must still revert those
-        // entries here because `MerkleUnwind` runs after this stage (in unwind
-        // order) and needs `HashedAccounts` to reflect the target block state
-        // before it can verify the state root.
         let (range, unwind_progress, _) =
             input.unwind_block_range_with_threshold(self.commit_threshold);
 
@@ -392,7 +371,7 @@ mod tests {
                     block_number,
                     stage_checkpoint: Some(StageUnitCheckpoint::Account(AccountHashingCheckpoint {
                         progress: EntitiesCheckpoint {
-                            processed,
+                            processed: _, // RocksDB can't see uncommitted writes in count_entries
                             total,
                         },
                         ..
@@ -400,8 +379,7 @@ mod tests {
                 },
                 done: true,
             }) if block_number == previous_stage &&
-                processed == total &&
-                total == runner.db.count_entries::<tables::PlainAccountState>().unwrap() as u64
+                total == runner.db.table::<tables::PlainAccountState>().unwrap().len() as u64
         );
 
         // Validate the stage execution

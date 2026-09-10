@@ -1,7 +1,5 @@
-//! BAL read-set prewarming pool.
-
 use alloy_primitives::{Address, StorageKey};
-use reth_execution_cache::{CachedStateProvider, ExecutionCache, TxPoolPrewarmCacheSnapshot};
+use reth_execution_cache::{CachedStateProvider, ExecutionCache};
 use reth_provider::{
     AccountReader, BytecodeReader, ProviderResult, StateProvider, StateProviderBox,
 };
@@ -12,38 +10,32 @@ use std::{
     },
     thread::JoinHandle,
 };
-use tokio::sync::oneshot;
 use tracing::trace;
 
 /// Builds a fresh `StateProviderBox` over the block's parent state. Type-erased so the pool is not
 /// generic over the provider factory; each worker builds its own per block.
-pub type BuildProviderFn = dyn Fn() -> ProviderResult<StateProviderBox> + Send + Sync;
+type BuildProviderFn = dyn Fn() -> ProviderResult<StateProviderBox> + Send + Sync;
 
-/// A single warm request: a whole account (basic account + its bytecode) followed by a batch of
-/// its storage slots, or a batch of storage slots on their own.
+/// A single warm request: a whole account (basic account + its bytecode) or one storage slot.
 enum PrewarmTarget {
-    Account(Address, Box<[StorageKey]>),
-    Storage(Address, Box<[StorageKey]>),
+    Account(Address),
+    Storage(Address, StorageKey),
 }
 
 /// A message in a worker's queue. The per-block lifecycle is explicit and ordered (the queue is
 /// FIFO): one `BeginBlock`, then the worker's share of `Warm`s, then one `EndBlock`.
 enum PrewarmMsg {
     /// Open a read txn for the new block: build a provider over the parent state and hold it.
-    BeginBlock {
-        build: Arc<BuildProviderFn>,
-        caches: ExecutionCache,
-        txpool_snapshot: Option<TxPoolPrewarmCacheSnapshot>,
-    },
+    BeginBlock { build: Arc<BuildProviderFn>, caches: ExecutionCache },
     /// Warm one target into the held provider's cache. Ignored if no provider is held.
     Warm(PrewarmTarget),
     /// Drop the held provider (and its read txn).
-    EndBlock(Arc<SendOnDrop>),
+    EndBlock,
 }
 
 /// Long-lived pool of blocking threads that warm the BAL read-set into the shared execution cache.
 #[derive(Debug)]
-pub struct BalPrewarmPool {
+pub(crate) struct BalPrewarmPool {
     /// One queue per worker. `BeginBlock`/`EndBlock` are broadcast to all; `Warm`s round-robin.
     workers: Vec<crossbeam_channel::Sender<PrewarmMsg>>,
     /// Round-robin cursor for distributing warm requests across workers.
@@ -54,7 +46,7 @@ pub struct BalPrewarmPool {
 impl BalPrewarmPool {
     /// Spawns `num_threads` long-lived blocking worker threads. Owned by the
     /// [`PayloadProcessor`](super::PayloadProcessor); the threads exit when the pool is dropped.
-    pub fn new(num_threads: usize) -> Arc<Self> {
+    pub(crate) fn new(num_threads: usize) -> Arc<Self> {
         let mut workers = Vec::with_capacity(num_threads);
         let mut handles = Vec::with_capacity(num_threads);
         for i in 0..num_threads {
@@ -73,54 +65,29 @@ impl BalPrewarmPool {
 
     /// Begins a block: hands every worker the provider builder and shared cache so each opens its
     /// own read txn over the parent state. Pair with [`end_block`](Self::end_block).
-    pub fn begin_block(
-        &self,
-        build: Arc<BuildProviderFn>,
-        caches: ExecutionCache,
-        txpool_snapshot: Option<TxPoolPrewarmCacheSnapshot>,
-    ) {
+    pub(crate) fn begin_block(&self, build: Arc<BuildProviderFn>, caches: ExecutionCache) {
         for worker in &self.workers {
-            let _ = worker.send(PrewarmMsg::BeginBlock {
-                build: build.clone(),
-                caches: caches.clone(),
-                txpool_snapshot: txpool_snapshot.clone(),
-            });
+            let _ = worker
+                .send(PrewarmMsg::BeginBlock { build: build.clone(), caches: caches.clone() });
         }
     }
 
-    /// Fire-and-forget: warm an account (basic account + bytecode) and its storage slots.
-    ///
-    /// The slots are dispatched in `WARM_BATCH_SIZE` chunks that are distributed independently,
-    /// so a single account with a large read-set does not serialize onto one worker;
-    /// [`end_block`](Self::end_block) waits for the slowest queue.
-    pub fn warm_account(&self, addr: Address, slots: impl IntoIterator<Item = StorageKey>) {
-        let mut slots = slots.into_iter();
-        let mut batch: Box<[StorageKey]> = slots.by_ref().take(WARM_BATCH_SIZE).collect();
-        self.send_warm(PrewarmTarget::Account(addr, batch));
+    /// Fire-and-forget: warm an account (basic account + bytecode) on some worker.
+    pub(crate) fn warm_account(&self, addr: Address) {
+        self.send_warm(PrewarmTarget::Account(addr));
+    }
 
-        loop {
-            batch = slots.by_ref().take(WARM_BATCH_SIZE).collect();
-            if batch.is_empty() {
-                break
-            }
-            self.send_warm(PrewarmTarget::Storage(addr, batch));
-        }
+    /// Fire-and-forget: warm one storage slot on some worker.
+    pub(crate) fn warm_storage(&self, addr: Address, slot: StorageKey) {
+        self.send_warm(PrewarmTarget::Storage(addr, slot));
     }
 
     /// Ends the block: every worker drops its provider (and read txn) once it has drained the warm
     /// requests queued ahead of this message.
-    ///
-    /// Blocks until all workers processed the end block message.
-    pub fn end_block(&self) {
-        let (tx, rx) = oneshot::channel();
-        let tx = Arc::new(SendOnDrop { sender: Some(tx) });
-
+    pub(crate) fn end_block(&self) {
         for worker in &self.workers {
-            let _ = worker.send(PrewarmMsg::EndBlock(tx.clone()));
+            let _ = worker.send(PrewarmMsg::EndBlock);
         }
-
-        drop(tx);
-        rx.blocking_recv().expect("BAL prewarm pool dropped without signaling completion");
     }
 
     fn send_warm(&self, target: PrewarmTarget) {
@@ -149,14 +116,7 @@ impl BalPrewarmPool {
 /// time to finish is 312.5ms at QD=32 and 156.26ms at QD=64.
 ///
 /// This should explain why this particular value is picked.
-pub const DEFAULT_BAL_PREWARM_THREADS: usize = 128;
-
-/// Number of storage slots carried by one warm message.
-///
-/// Batching amortizes the send over many slots and hands the worker a run of slots that live
-/// close together in the storage table, while the cap keeps enough messages in flight to saturate
-/// the workers on blocks whose read-set is concentrated in a few accounts.
-const WARM_BATCH_SIZE: usize = 8;
+pub(crate) const DEFAULT_BAL_PREWARM_THREADS: usize = 128;
 
 fn prewarm_loop(rx: crossbeam_channel::Receiver<PrewarmMsg>) {
     // The provider (and its MDBX read txn) held for the current block, between `BeginBlock` and
@@ -166,12 +126,9 @@ fn prewarm_loop(rx: crossbeam_channel::Receiver<PrewarmMsg>) {
     // Blocks when idle; the channel disconnects (and the loop ends) when the pool is dropped.
     while let Ok(msg) = rx.recv() {
         match msg {
-            PrewarmMsg::BeginBlock { build, caches, txpool_snapshot } => {
+            PrewarmMsg::BeginBlock { build, caches } => {
                 provider = match (build)() {
-                    Ok(inner) => Some(
-                        CachedStateProvider::new_prewarm(inner, caches)
-                            .with_txpool_snapshot(txpool_snapshot),
-                    ),
+                    Ok(inner) => Some(CachedStateProvider::new_prewarm(inner, caches)),
                     Err(err) => {
                         trace!(target: "engine::tree::bal_prewarm_pool", %err, "failed to build provider");
                         None
@@ -181,39 +138,22 @@ fn prewarm_loop(rx: crossbeam_channel::Receiver<PrewarmMsg>) {
             PrewarmMsg::Warm(target) => {
                 let Some(provider) = provider.as_ref() else { continue };
                 match target {
-                    PrewarmTarget::Account(addr, slots) => {
+                    PrewarmTarget::Account(addr) => {
                         if let Ok(Some(account)) = provider.basic_account(&addr) &&
                             let Some(code_hash) = account.bytecode_hash &&
                             code_hash != alloy_consensus::constants::KECCAK_EMPTY
                         {
                             let _ = provider.bytecode_by_hash(&code_hash);
                         }
-                        for &slot in &slots {
-                            let _ = provider.storage(addr, slot);
-                        }
                     }
-                    PrewarmTarget::Storage(addr, slots) => {
-                        for &slot in &slots {
-                            let _ = provider.storage(addr, slot);
-                        }
+                    PrewarmTarget::Storage(addr, slot) => {
+                        let _ = provider.storage(addr, slot);
                     }
                 }
             }
-            PrewarmMsg::EndBlock(end_tx) => {
+            PrewarmMsg::EndBlock => {
                 provider = None;
-                drop(end_tx);
             }
-        }
-    }
-}
-struct SendOnDrop {
-    sender: Option<oneshot::Sender<()>>,
-}
-
-impl Drop for SendOnDrop {
-    fn drop(&mut self) {
-        if let Some(sender) = self.sender.take() {
-            let _ = sender.send(());
         }
     }
 }

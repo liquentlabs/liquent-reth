@@ -386,7 +386,7 @@ where
             .map(|(exex_id, num_hash)| {
                 num_hash.map_or(Ok((exex_id, num_hash, false)), |num_hash| {
                     self.provider
-                        .is_known(num_hash.hash)
+                        .is_known(&num_hash.hash)
                         // Save the ExEx ID, finished height, and whether the hash is canonical
                         .map(|is_canonical| (exex_id, Some(num_hash), is_canonical))
                 })
@@ -688,7 +688,8 @@ mod tests {
     use reth_primitives_traits::RecoveredBlock;
     use reth_provider::{
         providers::BlockchainProvider, test_utils::create_test_provider_factory, BlockReader,
-        BlockWriter, Chain, DBProvider, DatabaseProviderFactory, TransactionVariant,
+        BlockWriter, Chain, DBProvider, DatabaseProviderFactory, StorageLocation,
+        TransactionVariant,
     };
     use reth_testing_utils::generators::{self, random_block, BlockParams};
 
@@ -1078,7 +1079,7 @@ mod tests {
         // Setup a notification
         let notification = ExExNotification::ChainCommitted {
             new: Arc::new(Chain::new(
-                vec![RecoveredBlock::default()],
+                vec![Default::default()],
                 Default::default(),
                 Default::default(),
             )),
@@ -1148,7 +1149,7 @@ mod tests {
         // Setup a notification
         let notification = ExExNotification::ChainCommitted {
             new: Arc::new(Chain::new(
-                vec![RecoveredBlock::default()],
+                vec![Default::default()],
                 Default::default(),
                 Default::default(),
             )),
@@ -1324,7 +1325,7 @@ mod tests {
         .try_recover()
         .unwrap();
         let provider_rw = provider_factory.database_provider_rw().unwrap();
-        provider_rw.insert_block(&block).unwrap();
+        provider_rw.insert_block(block.clone(), StorageLocation::Database).unwrap();
         provider_rw.commit().unwrap();
 
         let provider = BlockchainProvider::new(provider_factory).unwrap();

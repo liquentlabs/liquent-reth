@@ -3,7 +3,7 @@ use crate::common::{AccessRights, CliNodeComponents, CliNodeTypes, Environment, 
 use clap::Parser;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_cli::chainspec::ChainSpecParser;
-use reth_db::{init_db, mdbx::DatabaseArguments, DatabaseEnv};
+use reth_db::{init_db, DatabaseArguments, DatabaseEnv};
 use reth_db_api::{
     cursor::DbCursorRO, database::Database, models::ClientVersion, table::TableImporter, tables,
     transaction::DbTx,
@@ -75,19 +75,18 @@ pub struct StageCommand {
 }
 
 macro_rules! handle_stage {
-    ($stage_fn:ident, $tool:expr, $command:expr, $runtime:expr) => {{
+    ($stage_fn:ident, $tool:expr, $command:expr) => {{
         let StageCommand { output_datadir, from, to, dry_run, .. } = $command;
         let output_datadir =
             output_datadir.with_chain($tool.chain().chain(), DatadirArgs::default());
-        $stage_fn($tool, *from, *to, output_datadir, *dry_run, $runtime).await?
+        $stage_fn($tool, *from, *to, output_datadir, *dry_run).await?
     }};
 
-    ($stage_fn:ident, $tool:expr, $command:expr, $executor:expr, $consensus:expr, $runtime:expr) => {{
+    ($stage_fn:ident, $tool:expr, $command:expr, $executor:expr, $consensus:expr) => {{
         let StageCommand { output_datadir, from, to, dry_run, .. } = $command;
         let output_datadir =
             output_datadir.with_chain($tool.chain().chain(), DatadirArgs::default());
-        $stage_fn($tool, *from, *to, output_datadir, *dry_run, $executor, $consensus, $runtime)
-            .await?
+        $stage_fn($tool, *from, *to, output_datadir, *dry_run, $executor, $consensus).await?
     }};
 }
 
@@ -113,23 +112,12 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + EthereumHardforks>> Command<C>
 
         match &self.command {
             Stages::Execution(cmd) => {
-                handle_stage!(
-                    dump_execution_stage,
-                    &tool,
-                    cmd,
-                    evm_config,
-                    consensus,
-                    runtime.clone()
-                )
+                handle_stage!(dump_execution_stage, &tool, cmd, evm_config, consensus)
             }
-            Stages::StorageHashing(cmd) => {
-                handle_stage!(dump_hashing_storage_stage, &tool, cmd, runtime.clone())
-            }
-            Stages::AccountHashing(cmd) => {
-                handle_stage!(dump_hashing_account_stage, &tool, cmd, runtime.clone())
-            }
+            Stages::StorageHashing(cmd) => handle_stage!(dump_hashing_storage_stage, &tool, cmd),
+            Stages::AccountHashing(cmd) => handle_stage!(dump_hashing_account_stage, &tool, cmd),
             Stages::Merkle(cmd) => {
-                handle_stage!(dump_merkle_stage, &tool, cmd, evm_config, consensus, runtime.clone())
+                handle_stage!(dump_merkle_stage, &tool, cmd, evm_config, consensus)
             }
         }
 

@@ -2,6 +2,7 @@
 
 use crate::launcher::Launcher;
 use clap::{value_parser, Args, Parser};
+use liquent_primitives::init_liquent_config;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_runner::CliContext;
@@ -9,9 +10,9 @@ use reth_db::init_db;
 use reth_node_builder::NodeBuilder;
 use reth_node_core::{
     args::{
-        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, EraArgs, JitArgs, MetricArgs,
-        NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, StaticFilesArgs, StorageArgs,
-        TxPoolArgs,
+        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, EraArgs, LiquentArgs,
+        MetricArgs, NetworkArgs, PayloadBuilderArgs, PruningArgs, RpcServerArgs, StaticFilesArgs,
+        StorageArgs, TxPoolArgs,
     },
     node_config::NodeConfig,
     version,
@@ -103,6 +104,10 @@ pub struct NodeCommand<C: ChainSpecParser, Ext: clap::Args + fmt::Debug = NoArgs
     #[command(flatten)]
     pub pruning: PruningArgs,
 
+    /// All liquent related arguments
+    #[command(flatten)]
+    pub liquent: LiquentArgs,
+
     /// Engine cli arguments
     #[command(flatten, next_help_heading = "Engine")]
     pub engine: EngineArgs,
@@ -118,10 +123,6 @@ pub struct NodeCommand<C: ChainSpecParser, Ext: clap::Args + fmt::Debug = NoArgs
     /// All storage related arguments with --storage prefix
     #[command(flatten, next_help_heading = "Storage")]
     pub storage: StorageArgs,
-
-    /// All JIT related arguments with --jit prefix
-    #[command(flatten, next_help_heading = "JIT")]
-    pub jit: JitArgs,
 
     /// Additional cli arguments
     #[command(flatten, next_help_heading = "Extension")]
@@ -179,11 +180,16 @@ where
             era,
             static_files,
             storage,
-            jit,
+            liquent,
             ext,
         } = self;
 
         engine.validate()?;
+
+        // Initialize global liquent config
+        let liquent_config = liquent.to_config();
+        tracing::info!(target: "reth::cli", liquent_config = ?liquent_config, "Initializing global liquent config");
+        init_liquent_config(liquent_config);
 
         // set up node config
         let mut node_config = NodeConfig {
@@ -204,15 +210,13 @@ where
             era,
             static_files,
             storage,
-            jit,
         };
 
         let data_dir = node_config.datadir();
         let db_path = data_dir.db();
 
         tracing::info!(target: "reth::cli", path = ?db_path, "Opening database");
-        let database = init_db(db_path.clone(), self.db.database_args())?
-            .with_metrics_if(self.db.metrics_enabled());
+        let database = Arc::new(init_db(db_path.clone(), self.db.database_args())?);
 
         if with_unused_ports {
             node_config = node_config.with_unused_ports();
@@ -232,32 +236,6 @@ impl<C: ChainSpecParser, Ext: clap::Args + fmt::Debug> NodeCommand<C, Ext> {
         Some(&self.chain)
     }
 }
-
-impl<C, Ext> NodeCommand<C, Ext>
-where
-    C: ChainSpecParser,
-    C::ChainSpec: EthChainSpec,
-    Ext: clap::Args + fmt::Debug,
-{
-    /// Loads (or generates) the p2p secret key from the datadir of the configured chain.
-    ///
-    /// This resolves the datadir for the configured chain and reads the secret key from its
-    /// default location, without starting the network.
-    pub fn p2p_secret_key(&self) -> eyre::Result<secp256k1::SecretKey> {
-        let data_dir = self.datadir.clone().resolve_datadir(self.chain.chain());
-        Ok(self.network.secret_key(data_dir.p2p_secret())?)
-    }
-
-    /// Derives the peer id from the configured p2p secret key without starting the network.
-    ///
-    /// Loads the p2p secret key via [`p2p_secret_key`](Self::p2p_secret_key) and returns the
-    /// corresponding [`PeerId`](reth_network_peers::PeerId).
-    pub fn peer_id(&self) -> eyre::Result<reth_network_peers::PeerId> {
-        let sk = self.p2p_secret_key()?;
-        Ok(reth_network_peers::pk2id(&sk.public_key(secp256k1::SECP256K1)))
-    }
-}
-
 /// No Additional arguments
 #[derive(Debug, Clone, Copy, Default, Args)]
 #[non_exhaustive]

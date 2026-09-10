@@ -28,7 +28,7 @@ tracing.workspace = true
 alloy-primitives = { workspace = true, features = ["rand"] }
 reth-provider = { workspace = true, features = ["test-utils"] }
 reth-revm = { workspace = true, features = ["test-utils"] }
-revm.workspace = true
+revm-state.workspace = true
 
 [features]
 test-utils = [

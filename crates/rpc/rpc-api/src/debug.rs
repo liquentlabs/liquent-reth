@@ -5,10 +5,10 @@ use alloy_primitives::{Address, Bytes, B256, U64};
 use alloy_rpc_types_debug::ExecutionWitness;
 use alloy_rpc_types_eth::{Account, AccountInfo, Bundle, Index, StateContext};
 use alloy_rpc_types_trace::geth::{
-    GethDebugTracingCallOptions, GethDebugTracingOptions, GethTrace, TraceResult,
+    BlockTraceResult, GethDebugTracingCallOptions, GethDebugTracingOptions, GethTrace, TraceResult,
 };
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
-use reth_trie_common::{updates::TrieUpdates, ExecutionWitnessMode, HashedPostState};
+use reth_trie_common::{updates::TrieUpdates, HashedPostState};
 
 /// Debug rpc interface.
 #[cfg_attr(not(feature = "client"), rpc(server, namespace = "debug"))]
@@ -21,10 +21,6 @@ pub trait DebugApi<TxReq: RpcObject> {
     /// Returns an RLP-encoded block.
     #[method(name = "getRawBlock")]
     async fn raw_block(&self, block_id: BlockId) -> RpcResult<Bytes>;
-
-    /// Returns the RLP-encoded EIP-7928 block access list.
-    #[method(name = "getRawBlockAccessList")]
-    async fn raw_block_access_list(&self, block_id: BlockId) -> RpcResult<Bytes>;
 
     /// Returns an EIP-2718 binary-encoded transaction.
     ///
@@ -44,24 +40,14 @@ pub trait DebugApi<TxReq: RpcObject> {
     #[method(name = "getBadBlocks")]
     async fn bad_blocks(&self) -> RpcResult<Vec<serde_json::Value>>;
 
-    /// Clears all transactions from the transaction pool.
-    #[method(name = "clearTxpool")]
-    async fn debug_clear_txpool(&self) -> RpcResult<()>;
-
-    /// Subscribes to structured logs created during EVM execution between two blocks, excluding
-    /// the start block and including the end block.
-    #[subscription(
-        name = "subscribe" => "subscription",
-        unsubscribe = "unsubscribe",
-        item = alloy_rpc_types_trace::geth::ChainBlockTraceResult
-    )]
-    async fn debug_subscribe(
+    /// Returns the structured logs created during the execution of EVM between two blocks
+    /// (excluding start) as a JSON object.
+    #[method(name = "traceChain")]
+    async fn debug_trace_chain(
         &self,
-        subscription: String,
         start_exclusive: BlockNumberOrTag,
         end_inclusive: BlockNumberOrTag,
-        opts: Option<GethDebugTracingOptions>,
-    ) -> jsonrpsee::core::SubscriptionResult;
+    ) -> RpcResult<Vec<BlockTraceResult>>;
 
     /// The `debug_traceBlock` method will return a full stack trace of all invoked opcodes of all
     /// transaction that were included in this block.
@@ -153,27 +139,21 @@ pub trait DebugApi<TxReq: RpcObject> {
     /// to their preimages that were required during the execution of the block, including during
     /// state root recomputation.
     ///
-    /// The first argument is the block identifier. The optional second argument selects the
-    /// witness generation mode and defaults to `legacy`.
+    /// The first argument is the block number or tag.
     #[method(name = "executionWitness")]
-    async fn debug_execution_witness(
-        &self,
-        block: BlockId,
-        mode: Option<ExecutionWitnessMode>,
-    ) -> RpcResult<ExecutionWitness>;
+    async fn debug_execution_witness(&self, block: BlockNumberOrTag)
+        -> RpcResult<ExecutionWitness>;
 
     /// The `debug_executionWitnessByBlockHash` method allows for re-execution of a block with the
     /// purpose of generating an execution witness. The witness comprises of a map of all hashed
     /// trie nodes to their preimages that were required during the execution of the block,
     /// including during state root recomputation.
     ///
-    /// The first argument is the block hash. The optional second argument selects the witness
-    /// generation mode and defaults to `legacy`.
+    /// The first argument is the block hash.
     #[method(name = "executionWitnessByBlockHash")]
     async fn debug_execution_witness_by_block_hash(
         &self,
         hash: B256,
-        mode: Option<ExecutionWitnessMode>,
     ) -> RpcResult<ExecutionWitness>;
 
     /// Returns account information, including the storage root, at the state after executing the
@@ -380,4 +360,14 @@ pub trait DebugApi<TxReq: RpcObject> {
         block_hash: B256,
         opts: Option<GethDebugTracingCallOptions>,
     ) -> RpcResult<Vec<TraceResult>>;
+
+    /// Sets a failpoint with the given name and action.
+    ///
+    /// This method allows runtime fault injection for testing recovery logic.
+    /// Actions: "off", "return", "sleep(ms)", "panic", "print", "pause", "yield"
+    /// Example: "100%return" triggers 100% of the time
+    ///
+    /// Note: Only available when built with the `failpoints` feature.
+    #[method(name = "setFailpoint")]
+    async fn debug_set_failpoint(&self, name: String, actions: String) -> RpcResult<()>;
 }

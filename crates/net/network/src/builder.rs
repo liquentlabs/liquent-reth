@@ -15,7 +15,6 @@ use crate::{
 use reth_eth_wire::{EthNetworkPrimitives, NetworkPrimitives};
 use reth_metrics::common::mpsc::memory_bounded_channel;
 use reth_network_api::test_utils::PeersHandleProvider;
-use reth_storage_api::BalProvider;
 use reth_transaction_pool::{BlobStore, TransactionPool};
 use tokio::sync::mpsc;
 
@@ -34,15 +33,6 @@ pub struct NetworkBuilder<Tx, Eth, N: NetworkPrimitives = EthNetworkPrimitives> 
 // === impl NetworkBuilder ===
 
 impl<Tx, Eth, N: NetworkPrimitives> NetworkBuilder<Tx, Eth, N> {
-    /// Maps the transactions component.
-    pub fn map_transactions<F, NewTx>(self, f: F) -> NetworkBuilder<NewTx, Eth, N>
-    where
-        F: FnOnce(Tx) -> NewTx,
-    {
-        let Self { network, transactions, request_handler } = self;
-        NetworkBuilder { network, transactions: f(transactions), request_handler }
-    }
-
     /// Consumes the type and returns all fields.
     pub fn split(self) -> (NetworkManager<N>, Tx, Eth) {
         let Self { network, transactions, request_handler } = self;
@@ -75,10 +65,7 @@ impl<Tx, Eth, N: NetworkPrimitives> NetworkBuilder<Tx, Eth, N> {
     pub fn request_handler<Client>(
         self,
         client: Client,
-    ) -> NetworkBuilder<Tx, EthRequestHandler<Client, N>, N>
-    where
-        Client: BalProvider,
-    {
+    ) -> NetworkBuilder<Tx, EthRequestHandler<Client, N>, N> {
         let Self { mut network, transactions, .. } = self;
         let (tx, rx) = mpsc::channel(ETH_REQUEST_CHANNEL_CAPACITY);
         network.set_eth_request_handler(tx);
@@ -92,10 +79,7 @@ impl<Tx, Eth, N: NetworkPrimitives> NetworkBuilder<Tx, Eth, N> {
         self,
         client: Client,
         blob_store: Box<dyn BlobStore>,
-    ) -> NetworkBuilder<Tx, EthRequestHandler<Client, N>, N>
-    where
-        Client: BalProvider,
-    {
+    ) -> NetworkBuilder<Tx, EthRequestHandler<Client, N>, N> {
         let NetworkBuilder { network, transactions, request_handler } =
             self.request_handler(client);
         let request_handler = request_handler.with_blob_store(blob_store);

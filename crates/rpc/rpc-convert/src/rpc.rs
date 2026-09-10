@@ -12,8 +12,6 @@ pub trait RpcTypes: Send + Sync + Clone + Unpin + Debug + 'static {
     type Header: RpcObject + HeaderResponse;
     /// Receipt response type.
     type Receipt: RpcObject + ReceiptResponse;
-    /// Log response type.
-    type Log: RpcObject;
     /// Transaction response type.
     type TransactionResponse: RpcObject + TransactionResponse;
     /// Transaction response type.
@@ -26,8 +24,6 @@ where
 {
     type Header = T::HeaderResponse;
     type Receipt = T::ReceiptResponse;
-    // Default network implementations to Ethereum logs until Alloy exposes a log response type.
-    type Log = alloy_rpc_types_eth::Log;
     type TransactionResponse = T::TransactionResponse;
     type TransactionRequest = T::TransactionRequest;
 }
@@ -37,9 +33,6 @@ pub type RpcTransaction<T> = <T as RpcTypes>::TransactionResponse;
 
 /// Adapter for network specific receipt response.
 pub type RpcReceipt<T> = <T as RpcTypes>::Receipt;
-
-/// Adapter for network specific log response.
-pub type RpcLog<T> = <T as RpcTypes>::Log;
 
 /// Adapter for network specific header response.
 pub type RpcHeader<T> = <T as RpcTypes>::Header;

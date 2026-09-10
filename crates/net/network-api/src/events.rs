@@ -1,17 +1,14 @@
 //! API related to listening for network events.
 
 use reth_eth_wire_types::{
-    message::RequestPair, snap::SnapProtocolMessage, BlockAccessLists, BlockBodies, BlockHeaders,
-    Capabilities, Cells, DisconnectReason, EthMessage, EthNetworkPrimitives, EthVersion,
-    GetBlockAccessLists, GetBlockBodies, GetBlockHeaders, GetCells, GetNodeData,
-    GetPooledTransactions, GetReceipts, GetReceipts70, NetworkPrimitives, NodeData,
-    PooledTransactions, Receipts, Receipts69, Receipts70, UnifiedStatus,
+    message::RequestPair, BlockAccessLists, BlockBodies, BlockHeaders, Capabilities, Cells,
+    DisconnectReason, EthMessage, EthNetworkPrimitives, EthVersion, GetBlockAccessLists,
+    GetBlockBodies, GetBlockHeaders, GetCells, GetNodeData, GetPooledTransactions, GetReceipts,
+    GetReceipts70, NetworkPrimitives, NodeData, PooledTransactions, Receipts, Receipts69,
+    Receipts70, UnifiedStatus,
 };
 use reth_ethereum_forks::ForkId;
-use reth_network_p2p::{
-    error::{RequestError, RequestResult},
-    snap::client::SnapResponse,
-};
+use reth_network_p2p::error::{RequestError, RequestResult};
 use reth_network_peers::{NodeRecord, PeerId};
 use reth_network_types::{PeerAddr, PeerKind};
 use reth_tokio_util::EventStream;
@@ -274,25 +271,6 @@ pub enum PeerRequest<N: NetworkPrimitives = EthNetworkPrimitives> {
         /// The channel to send the response for cells.
         response: oneshot::Sender<RequestResult<Cells>>,
     },
-    /// Requests a `snap/2` (EIP-8189) message from the peer.
-    ///
-    /// The response should be sent through the channel.
-    GetSnap {
-        /// The `snap/2` request to send.
-        request: SnapProtocolMessage,
-        /// The channel to send the response for the request.
-        response: oneshot::Sender<RequestResult<SnapResponse>>,
-    },
-}
-
-/// The wire message a [`PeerRequest`] resolves to before it's queued for sending: either an `eth`
-/// message or a `snap/2` message.
-#[derive(Debug)]
-pub enum RequestMessage<N: NetworkPrimitives = EthNetworkPrimitives> {
-    /// An `eth` protocol message.
-    Eth(EthMessage<N>),
-    /// A `snap/2` (EIP-8189) protocol message.
-    Snap(SnapProtocolMessage),
 }
 
 // === impl PeerRequest ===
@@ -315,7 +293,6 @@ impl<N: NetworkPrimitives> PeerRequest<N> {
             Self::GetReceipts70 { response, .. } => response.send(Err(err)).ok(),
             Self::GetBlockAccessLists { response, .. } => response.send(Err(err)).ok(),
             Self::GetCells { response, .. } => response.send(Err(err)).ok(),
-            Self::GetSnap { response, .. } => response.send(Err(err)).ok(),
         };
     }
 
@@ -329,61 +306,38 @@ impl<N: NetworkPrimitives> PeerRequest<N> {
         }
     }
 
-    /// Returns the [`RequestMessage`] for this type.
-    pub fn create_request_message(&self, request_id: u64) -> RequestMessage<N> {
+    /// Returns the [`EthMessage`] for this type
+    pub fn create_request_message(&self, request_id: u64) -> EthMessage<N> {
         match self {
             Self::GetBlockHeaders { request, .. } => {
-                RequestMessage::Eth(EthMessage::GetBlockHeaders(RequestPair {
-                    request_id,
-                    message: *request,
-                }))
+                EthMessage::GetBlockHeaders(RequestPair { request_id, message: *request })
             }
             Self::GetBlockBodies { request, .. } => {
-                RequestMessage::Eth(EthMessage::GetBlockBodies(RequestPair {
-                    request_id,
-                    message: request.clone(),
-                }))
+                EthMessage::GetBlockBodies(RequestPair { request_id, message: request.clone() })
             }
             Self::GetPooledTransactions { request, .. } => {
-                RequestMessage::Eth(EthMessage::GetPooledTransactions(RequestPair {
+                EthMessage::GetPooledTransactions(RequestPair {
                     request_id,
                     message: request.clone(),
-                }))
+                })
             }
             Self::GetNodeData { request, .. } => {
-                RequestMessage::Eth(EthMessage::GetNodeData(RequestPair {
-                    request_id,
-                    message: request.clone(),
-                }))
+                EthMessage::GetNodeData(RequestPair { request_id, message: request.clone() })
             }
             Self::GetReceipts { request, .. } | Self::GetReceipts69 { request, .. } => {
-                RequestMessage::Eth(EthMessage::GetReceipts(RequestPair {
-                    request_id,
-                    message: request.clone(),
-                }))
+                EthMessage::GetReceipts(RequestPair { request_id, message: request.clone() })
             }
             Self::GetReceipts70 { request, .. } => {
-                RequestMessage::Eth(EthMessage::GetReceipts70(RequestPair {
-                    request_id,
-                    message: request.clone(),
-                }))
+                EthMessage::GetReceipts70(RequestPair { request_id, message: request.clone() })
             }
             Self::GetBlockAccessLists { request, .. } => {
-                RequestMessage::Eth(EthMessage::GetBlockAccessLists(RequestPair {
+                EthMessage::GetBlockAccessLists(RequestPair {
                     request_id,
                     message: request.clone(),
-                }))
+                })
             }
             Self::GetCells { request, .. } => {
-                RequestMessage::Eth(EthMessage::GetCells(RequestPair {
-                    request_id,
-                    message: request.clone(),
-                }))
-            }
-            Self::GetSnap { request, .. } => {
-                let mut message = request.clone();
-                message.set_request_id(request_id);
-                RequestMessage::Snap(message)
+                EthMessage::GetCells(RequestPair { request_id, message: request.clone() })
             }
         }
     }

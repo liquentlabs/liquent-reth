@@ -22,6 +22,3 @@ pub mod common;
 
 /// Re-export core metrics crate.
 pub use metrics;
-
-/// Per-thread resource usage measurement.
-pub mod thread;

@@ -11,11 +11,11 @@ use reth_execution_types::ExecutionOutcome;
 use reth_primitives_traits::Bytecode;
 use reth_storage_errors::provider::ProviderResult;
 use reth_trie_common::HashedPostState;
-use revm::database::BundleState;
+use revm_database::BundleState;
 
 /// This just receives state, or [`ExecutionOutcome`], from the provider
 #[auto_impl::auto_impl(&, Arc, Box)]
-pub trait StateReader: Send {
+pub trait StateReader: Send + Sync {
     /// Receipt type in [`ExecutionOutcome`].
     type Receipt: Send + Sync;
 
@@ -27,7 +27,7 @@ pub trait StateReader: Send {
 }
 
 /// Type alias of boxed [`StateProvider`].
-pub type StateProviderBox = Box<dyn StateProvider + Send + 'static>;
+pub type StateProviderBox = Box<dyn StateProvider>;
 
 /// An abstraction for a type that provides state data.
 #[auto_impl(&, Arc, Box)]
@@ -39,6 +39,8 @@ pub trait StateProvider:
     + StorageRootProvider
     + StateProofProvider
     + HashedPostStateProvider
+    + Send
+    + Sync
 {
     /// Get storage of given account.
     fn storage(
@@ -96,20 +98,25 @@ impl<T: AccountReader + BytecodeReader> AccountInfoReader for T {}
 
 /// Trait that provides the hashed state from various sources.
 #[auto_impl(&, Arc, Box)]
-pub trait HashedPostStateProvider {
-    /// Returns the [`HashedPostState`] of the provided [`BundleState`], materializing zero-valued
-    /// updates for parent storage of accounts that were destroyed but remain in the post-state.
-    ///
-    /// Providers backed by an exact parent-state view also materialize terminally destroyed
-    /// accounts with explicit zero-valued storage updates.
-    fn hashed_post_state(&self, bundle_state: &BundleState) -> ProviderResult<HashedPostState>;
+pub trait HashedPostStateProvider: Send + Sync {
+    /// Returns the `HashedPostState` of the provided [`BundleState`].
+    fn hashed_post_state(&self, bundle_state: &BundleState) -> HashedPostState;
 }
 
 /// Trait for reading bytecode associated with a given code hash.
 #[auto_impl(&, Arc, Box)]
-pub trait BytecodeReader {
+pub trait BytecodeReader: Send + Sync {
     /// Get account code by its hash
     fn bytecode_by_hash(&self, code_hash: &B256) -> ProviderResult<Option<Bytecode>>;
+}
+
+/// Trait implemented for database providers that can be converted into a historical state provider.
+pub trait TryIntoHistoricalStateProvider {
+    /// Returns a historical [`StateProvider`] indexed by the given historic block number.
+    fn try_into_history_at_block(
+        self,
+        block_number: BlockNumber,
+    ) -> ProviderResult<StateProviderBox>;
 }
 
 /// Light wrapper that returns `StateProvider` implementations that correspond to the given
@@ -126,7 +133,7 @@ pub trait BytecodeReader {
 /// Note: the `pending` block is considered the block that extends the canonical chain but one and
 /// has the `latest` block as its parent.
 ///
-/// All states are _inclusive_, meaning they include _all_ changes made (executed transactions)
+/// All states are _inclusive_, meaning they include _all_ all changes made (executed transactions)
 /// in their respective blocks. For example [`StateProviderFactory::history_by_block_number`] for
 /// block number `n` will return the state after block `n` was executed (transactions, withdrawals).
 /// In other words, all states point to the end of the state's respective block, which is equivalent
@@ -135,8 +142,8 @@ pub trait BytecodeReader {
 /// This affects tracing, or replaying blocks, which will need to be executed on top of the state of
 /// the parent block. For example, in order to trace block `n`, the state after block `n - 1` needs
 /// to be used, since block `n` was executed on its parent block's state.
-#[auto_impl(&, Box, Arc)]
-pub trait StateProviderFactory: BlockIdReader + Send {
+#[auto_impl(&, Arc, Box)]
+pub trait StateProviderFactory: BlockIdReader + Send + Sync {
     /// Storage provider for latest block.
     fn latest(&self) -> ProviderResult<StateProviderBox>;
 

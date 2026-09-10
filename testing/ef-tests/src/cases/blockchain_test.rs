@@ -16,12 +16,11 @@ use reth_evm_ethereum::EthEvmConfig;
 use reth_primitives_traits::{ParallelBridgeBuffered, RecoveredBlock, SealedBlock};
 use reth_provider::{
     test_utils::create_test_provider_factory_with_chain_spec, BlockWriter, DatabaseProviderFactory,
-    ExecutionOutcome, HashedPostStateProvider, HistoryWriter, OriginalValuesKnown,
-    StateWriteConfig, StateWriter, StaticFileProviderFactory, StaticFileSegment, StaticFileWriter,
-    StorageSettingsCache,
+    ExecutionOutcome, HistoryWriter, OriginalValuesKnown, StateWriter, StaticFileProviderFactory,
+    StaticFileSegment, StaticFileWriter, StorageLocation,
 };
 use reth_revm::database::StateProviderDatabase;
-use reth_trie::StateRoot;
+use reth_trie::{HashedPostState, KeccakKeyHasher, StateRoot};
 use reth_trie_db::DatabaseStateRoot;
 use std::{
     collections::BTreeMap,
@@ -205,7 +204,9 @@ fn run_case(case: &BlockchainTest) -> Result<(), Error> {
     .try_recover()
     .unwrap();
 
-    provider.insert_block(&genesis_block).map_err(|err| Error::block_failed(0, err))?;
+    provider
+        .insert_block(genesis_block.clone(), StorageLocation::StaticFiles)
+        .map_err(|err| Error::block_failed(0, err))?;
 
     // Increment block number for receipts static file
     provider
@@ -233,7 +234,9 @@ fn run_case(case: &BlockchainTest) -> Result<(), Error> {
         let block_number = (block_index + 1) as u64;
 
         // Insert the block into the database
-        provider.insert_block(block).map_err(|err| Error::block_failed(block_number, err))?;
+        provider
+            .insert_block(block.clone(), StorageLocation::StaticFiles)
+            .map_err(|err| Error::block_failed(block_number, err))?;
         provider
             .static_file_provider()
             .commit()
@@ -257,17 +260,11 @@ fn run_case(case: &BlockchainTest) -> Result<(), Error> {
             .map_err(|err| Error::block_failed(block_number, err))?;
 
         // Compute and check the post state root
-        let hashed_state = state_provider
-            .hashed_post_state(&output.state)
-            .map_err(|err| Error::block_failed(block_number, err))?;
-        let sorted = hashed_state.clone_into_sorted();
-        let (computed_state_root, _) = reth_trie_db::with_adapter!(provider, |A| {
-            StateRoot::<reth_trie_db::DatabaseTrieCursorFactory<_, A>, _>::overlay_root_with_updates(
-                provider.tx_ref(),
-                &sorted,
-            )
-        })
-        .map_err(|err| Error::block_failed(block_number, err))?;
+        let hashed_state =
+            HashedPostState::from_bundle_state::<KeccakKeyHasher>(output.state.state());
+        let (computed_state_root, _) =
+            StateRoot::overlay_root_with_updates(provider.tx_ref(), hashed_state.clone())
+                .map_err(|err| Error::block_failed(block_number, err))?;
         if computed_state_root != block.state_root {
             return Err(Error::block_failed(
                 block_number,
@@ -280,7 +277,7 @@ fn run_case(case: &BlockchainTest) -> Result<(), Error> {
             .write_state(
                 &ExecutionOutcome::single(block.number, output),
                 OriginalValuesKnown::Yes,
-                StateWriteConfig::default(),
+                StorageLocation::StaticFiles,
             )
             .map_err(|err| Error::block_failed(block_number, err))?;
 
@@ -332,7 +329,7 @@ fn decode_blocks(
             .map_err(|err| Error::block_failed(block_number, err))?;
 
         let recovered_block =
-            decoded.try_recover().map_err(|err| Error::block_failed(block_number, err))?;
+            decoded.clone().try_recover().map_err(|err| Error::block_failed(block_number, err))?;
 
         blocks.push(recovered_block);
     }

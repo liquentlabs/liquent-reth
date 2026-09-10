@@ -25,18 +25,20 @@ reth-trie-common.workspace = true
 # ethereum
 alloy-primitives.workspace = true
 alloy-consensus.workspace = true
-alloy-eips = { workspace = true, features = ["serde"] }
+alloy-genesis.workspace = true
 
 # codecs
 modular-bitfield.workspace = true
 roaring.workspace = true
 serde = { workspace = true, default-features = false }
+serde_json.workspace = true
+# liquent: `mod scale;` is unconditional (crates/storage/db-api/src/scale.rs)
+parity-scale-codec = { workspace = true, features = ["bytes"] }
 
 # metrics
 metrics.workspace = true
 
 # misc
-arrayvec.workspace = true
 derive_more.workspace = true
 bytes.workspace = true
 
@@ -81,5 +83,5 @@ arbitrary = [
     "reth-stages-types/arbitrary",
     "alloy-consensus/arbitrary",
     "reth-ethereum-primitives/arbitrary",
-    "alloy-eips/arbitrary",
+    "parity-scale-codec/arbitrary",
 ]

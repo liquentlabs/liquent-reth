@@ -47,9 +47,6 @@ pub fn should_run(start: &LazyLock<Instant>, last: &AtomicU64, duration_millis: 
 ///     tracing::info!("This message is throttled");
 /// });
 /// ```
-#[deprecated(
-    note = "no longer used by reth and scheduled for removal, copy the macro if you depend on it"
-)]
 #[macro_export]
 macro_rules! throttle {
     ($duration:expr, || $expr:expr) => {{
@@ -65,7 +62,6 @@ macro_rules! throttle {
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 

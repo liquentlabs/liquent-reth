@@ -7,12 +7,17 @@ use reth_config::config::{BlocksPerFileConfig, Config, PruneConfig, StaticFilesC
 use reth_db::tables;
 use reth_db_api::transaction::{DbTx, DbTxMut};
 use reth_node_core::args::DefaultPruningValues;
-use reth_prune_types::{
-    PruneCheckpoint, PruneMode, PruneSegment, MINIMUM_DISTANCE, MINIMUM_UNWIND_SAFE_DISTANCE,
-};
+use reth_prune_types::{PruneCheckpoint, PruneMode, PruneSegment};
 use reth_stages_types::StageCheckpoint;
 use std::{collections::BTreeMap, path::Path};
 use tracing::info;
+
+/// Minimum blocks to keep for receipts, matching `--minimal` prune settings.
+const MINIMUM_RECEIPTS_DISTANCE: u64 = 64;
+
+/// Minimum blocks to keep for history/bodies, matching `--minimal` prune settings
+/// (`MINIMUM_UNWIND_SAFE_DISTANCE`).
+const MINIMUM_HISTORY_DISTANCE: u64 = 10064;
 
 /// Writes a [`Config`] as TOML to `<data_dir>/reth.toml`.
 ///
@@ -176,19 +181,8 @@ pub(crate) fn config_for_selections(
         },
     };
 
-    if matches!(preset, Some(SelectionPreset::Archive)) {
+    if is_archive || matches!(preset, Some(SelectionPreset::Archive)) {
         return Config { static_files, ..Default::default() };
-    }
-
-    if matches!(preset, Some(SelectionPreset::Minimal)) {
-        return Config {
-            prune: PruneConfig {
-                segments: DefaultPruningValues::get_global().minimal_prune_modes.clone(),
-                ..Default::default()
-            },
-            static_files,
-            ..Default::default()
-        };
     }
 
     if matches!(preset, Some(SelectionPreset::Full)) {
@@ -211,10 +205,6 @@ pub(crate) fn config_for_selections(
         };
     }
 
-    if is_archive {
-        return Config { static_files, ..Default::default() };
-    }
-
     let mut config = Config::default();
     let mut prune = PruneConfig::default();
 
@@ -223,21 +213,19 @@ pub(crate) fn config_for_selections(
     }
     prune.segments.transaction_lookup = Some(PruneMode::Full);
 
-    if let Some(mode) = selection_to_prune_mode(tx_sel, Some(MINIMUM_UNWIND_SAFE_DISTANCE)) {
+    if let Some(mode) = selection_to_prune_mode(tx_sel, Some(MINIMUM_HISTORY_DISTANCE)) {
         prune.segments.bodies_history = Some(mode);
     }
 
-    if let Some(mode) = selection_to_prune_mode(receipt_sel, Some(MINIMUM_DISTANCE)) {
+    if let Some(mode) = selection_to_prune_mode(receipt_sel, Some(MINIMUM_RECEIPTS_DISTANCE)) {
         prune.segments.receipts = Some(mode);
     }
 
-    if let Some(mode) = selection_to_prune_mode(account_cs_sel, Some(MINIMUM_UNWIND_SAFE_DISTANCE))
-    {
+    if let Some(mode) = selection_to_prune_mode(account_cs_sel, Some(MINIMUM_HISTORY_DISTANCE)) {
         prune.segments.account_history = Some(mode);
     }
 
-    if let Some(mode) = selection_to_prune_mode(storage_cs_sel, Some(MINIMUM_UNWIND_SAFE_DISTANCE))
-    {
+    if let Some(mode) = selection_to_prune_mode(storage_cs_sel, Some(MINIMUM_HISTORY_DISTANCE)) {
         prune.segments.storage_history = Some(mode);
     }
 
@@ -306,14 +294,13 @@ mod tests {
             base_url: None,
             reth_version: None,
             components: BTreeMap::new(),
-            extensions: Default::default(),
         }
     }
 
     #[test]
     fn write_prune_checkpoints_sets_all_segments() {
         let dir = tempfile::tempdir().unwrap();
-        let db = reth_db::init_db(dir.path(), reth_db::mdbx::DatabaseArguments::default()).unwrap();
+        let db = reth_db::init_db(dir.path(), reth_db::DatabaseArguments::default()).unwrap();
 
         let mut selections = BTreeMap::new();
         selections.insert(SnapshotComponentType::State, ComponentSelection::All);
@@ -355,7 +342,7 @@ mod tests {
     #[test]
     fn write_prune_checkpoints_archive_no_checkpoints() {
         let dir = tempfile::tempdir().unwrap();
-        let db = reth_db::init_db(dir.path(), reth_db::mdbx::DatabaseArguments::default()).unwrap();
+        let db = reth_db::init_db(dir.path(), reth_db::DatabaseArguments::default()).unwrap();
 
         // Archive node — no pruning configured, so no checkpoints written
         let mut selections = BTreeMap::new();
@@ -421,16 +408,19 @@ mod tests {
         // All segments clamped to their minimum distances
         assert_eq!(
             config.prune.segments.bodies_history,
-            Some(PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE))
+            Some(PruneMode::Distance(MINIMUM_HISTORY_DISTANCE))
         );
-        assert_eq!(config.prune.segments.receipts, Some(PruneMode::Distance(MINIMUM_DISTANCE)));
+        assert_eq!(
+            config.prune.segments.receipts,
+            Some(PruneMode::Distance(MINIMUM_RECEIPTS_DISTANCE))
+        );
         assert_eq!(
             config.prune.segments.account_history,
-            Some(PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE))
+            Some(PruneMode::Distance(MINIMUM_HISTORY_DISTANCE))
         );
         assert_eq!(
             config.prune.segments.storage_history,
-            Some(PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE))
+            Some(PruneMode::Distance(MINIMUM_HISTORY_DISTANCE))
         );
     }
 
@@ -457,7 +447,10 @@ mod tests {
         assert_eq!(config.prune.segments.sender_recovery, Some(PruneMode::Full));
         // Bodies follows tx selection
         assert_eq!(config.prune.segments.bodies_history, Some(PruneMode::Distance(10_064)));
-        assert_eq!(config.prune.segments.receipts, Some(PruneMode::Distance(MINIMUM_DISTANCE)));
+        assert_eq!(
+            config.prune.segments.receipts,
+            Some(PruneMode::Distance(MINIMUM_RECEIPTS_DISTANCE))
+        );
         assert_eq!(config.prune.segments.account_history, Some(PruneMode::Distance(10_064)));
         assert_eq!(config.prune.segments.storage_history, Some(PruneMode::Distance(10_064)));
     }
@@ -513,15 +506,15 @@ mod tests {
         assert_eq!(config.prune.segments.transaction_lookup, None);
         assert_eq!(
             config.prune.segments.receipts,
-            Some(PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE))
+            Some(PruneMode::Distance(MINIMUM_HISTORY_DISTANCE))
         );
         assert_eq!(
             config.prune.segments.account_history,
-            Some(PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE))
+            Some(PruneMode::Distance(MINIMUM_HISTORY_DISTANCE))
         );
         assert_eq!(
             config.prune.segments.storage_history,
-            Some(PruneMode::Distance(MINIMUM_UNWIND_SAFE_DISTANCE))
+            Some(PruneMode::Distance(MINIMUM_HISTORY_DISTANCE))
         );
 
         let paris_block = chain_spec
@@ -529,18 +522,6 @@ mod tests {
             .block_number()
             .expect("mainnet Paris block should be known");
         assert_eq!(config.prune.segments.bodies_history, Some(PruneMode::Before(paris_block)));
-    }
-
-    #[test]
-    fn minimal_preset_matches_default_minimal_prune_config() {
-        let config = config_for_selections(
-            &BTreeMap::new(),
-            &empty_manifest(),
-            Some(SelectionPreset::Minimal),
-            None::<&reth_chainspec::ChainSpec>,
-        );
-
-        assert_eq!(&config.prune.segments, &DefaultPruningValues::get_global().minimal_prune_modes);
     }
 
     #[test]
@@ -584,7 +565,7 @@ mod tests {
     #[test]
     fn reset_index_stage_checkpoints_clears_only_rocksdb_index_stages() {
         let dir = tempfile::tempdir().unwrap();
-        let db = reth_db::init_db(dir.path(), reth_db::mdbx::DatabaseArguments::default()).unwrap();
+        let db = reth_db::init_db(dir.path(), reth_db::DatabaseArguments::default()).unwrap();
 
         // Simulate a fully synced node: set stage checkpoints at tip
         let tip_checkpoint = StageCheckpoint::new(24_500_000);

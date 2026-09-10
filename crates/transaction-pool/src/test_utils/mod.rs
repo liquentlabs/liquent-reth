@@ -9,6 +9,8 @@ pub use tx_gen::*;
 mod mock;
 pub use mock::*;
 
+mod pool;
+
 mod okvalidator;
 pub use okvalidator::*;
 

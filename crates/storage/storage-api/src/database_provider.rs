@@ -11,22 +11,13 @@ use reth_db_api::{
 use reth_prune_types::PruneModes;
 use reth_storage_errors::provider::ProviderResult;
 
-/// Provides shared access to a database transaction.
-#[auto_impl::auto_impl(&)]
-pub trait DbTxProvider {
+/// Database provider.
+pub trait DBProvider: Sized {
     /// Underlying database transaction held by the provider.
     type Tx: DbTx;
 
-    /// Returns the underlying database transaction.
-    fn tx(&self) -> &Self::Tx;
-}
-
-/// Database provider.
-pub trait DBProvider: DbTxProvider + Sized {
     /// Returns a reference to the underlying transaction.
-    fn tx_ref(&self) -> &Self::Tx {
-        self.tx()
-    }
+    fn tx_ref(&self) -> &Self::Tx;
 
     /// Returns a mutable reference to the underlying transaction.
     fn tx_mut(&mut self) -> &mut Self::Tx;
@@ -46,7 +37,9 @@ pub trait DBProvider: DbTxProvider + Sized {
     }
 
     /// Commit database transaction
-    fn commit(self) -> ProviderResult<()>;
+    fn commit(self) -> ProviderResult<bool> {
+        Ok(self.into_tx().commit()?)
+    }
 
     /// Returns a reference to prune modes.
     fn prune_modes_ref(&self) -> &PruneModes;
@@ -169,31 +162,7 @@ pub trait DatabaseProviderFactory: Send + Sync {
 /// Helper type alias to get the associated transaction type from a [`DatabaseProviderFactory`].
 pub type FactoryTx<F> = <<F as DatabaseProviderFactory>::DB as Database>::TX;
 
-/// A trait which can be used to describe any factory-like type which returns a read-only provider.
-pub trait DatabaseProviderROFactory {
-    /// Provider type returned by this factory.
-    ///
-    /// This type is intentionally left unconstrained; constraints can be added as-needed when this
-    /// is used.
-    type Provider;
-
-    /// Creates and returns a Provider.
-    fn database_provider_ro(&self) -> ProviderResult<Self::Provider>;
-}
-
-impl<T> DatabaseProviderROFactory for T
-where
-    T: DatabaseProviderFactory,
-{
-    type Provider = T::Provider;
-
-    fn database_provider_ro(&self) -> ProviderResult<Self::Provider> {
-        <T as DatabaseProviderFactory>::database_provider_ro(self)
-    }
-}
-
-/// Returns the length of the range if the range has a bounded end.
-pub fn range_size_hint(range: &impl RangeBounds<u64>) -> Option<usize> {
+fn range_size_hint(range: &impl RangeBounds<u64>) -> Option<usize> {
     let start = match range.start_bound().cloned() {
         Bound::Included(start) => start,
         Bound::Excluded(start) => start.checked_add(1)?,

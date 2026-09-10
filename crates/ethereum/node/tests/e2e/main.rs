@@ -1,9 +1,7 @@
 #![allow(missing_docs)]
 
-mod blobs;
 mod custom_genesis;
 mod dev;
-mod eip6780;
 mod eth;
 mod invalid_payload;
 mod p2p;

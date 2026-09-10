@@ -50,7 +50,7 @@ pub use txpool::{DefaultTxPoolValues, TxPoolArgs};
 
 /// DevArgs for configuring the dev testnet
 mod dev;
-pub use dev::{DefaultDevArgs, DevArgs};
+pub use dev::DevArgs;
 
 /// PruneArgs for configuring the pruning and full node
 mod pruning;
@@ -64,6 +64,14 @@ pub use datadir_args::DatadirArgs;
 mod engine;
 pub use engine::{DefaultEngineValues, EngineArgs};
 
+/// LiquentArgs for configuring liquent features
+mod liquent;
+pub use liquent::LiquentArgs;
+
+/// `RessArgs` for configuring ress subprotocol.
+mod ress_args;
+pub use ress_args::RessArgs;
+
 /// `EraArgs` for configuring ERA files import.
 mod era;
 pub use era::{DefaultEraHost, EraArgs, EraSourceArgs};
@@ -75,10 +83,6 @@ pub use static_files::{StaticFilesArgs, MINIMAL_BLOCKS_PER_FILE};
 /// `StorageArgs` for configuring storage settings.
 mod storage;
 pub use storage::{DefaultStorageValues, StorageArgs};
-
-/// `JitArgs` for configuring JIT compilation of EVM bytecode.
-mod jit;
-pub use jit::JitArgs;
 
 mod error;
 pub mod types;

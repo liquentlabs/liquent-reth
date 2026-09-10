@@ -22,20 +22,18 @@
 
 use crate::persistence::PersistenceResult;
 use alloy_eips::BlockNumHash;
+use alloy_primitives::B256;
 use crossbeam_channel::Receiver as CrossbeamReceiver;
-use reth_primitives_traits::FastInstant as Instant;
+use std::time::Instant;
 use tracing::trace;
 
 /// The state of the persistence task.
 #[derive(Debug)]
 pub struct PersistenceState {
-    /// Hash and number of the highest block whose non-state/trie outputs are persisted.
+    /// Hash and number of the last block persisted.
     ///
-    /// This tracks the highest canonical block with durable block/static-file/plain-state data.
+    /// This tracks the chain height that is persisted on disk
     pub(crate) last_persisted_block: BlockNumHash,
-    /// Hash and number of the highest block whose state/trie outputs were processed for
-    /// persistence.
-    pub(crate) last_state_trie_persisted_block: BlockNumHash,
     /// Receiver end of channel where the result of the persistence task will be
     /// sent when done. A None value means there's no persistence task in progress.
     pub(crate) rx:
@@ -70,7 +68,6 @@ impl PersistenceState {
 
     /// Returns the current persistence action. If there is no persistence task in progress, then
     /// this returns `None`.
-    #[cfg(test)]
     pub(crate) fn current_action(&self) -> Option<&CurrentPersistenceAction> {
         self.rx.as_ref().map(|rx| &rx.2)
     }
@@ -78,18 +75,13 @@ impl PersistenceState {
     /// Sets state for a finished persistence task.
     pub(crate) fn finish(
         &mut self,
-        last_persisted_block: BlockNumHash,
-        last_state_trie_persisted_block: BlockNumHash,
+        last_persisted_block_hash: B256,
+        last_persisted_block_number: u64,
     ) {
-        trace!(
-            target: "engine::tree",
-            last_persisted_block = %last_persisted_block.number,
-            last_state_trie_persisted_block = %last_state_trie_persisted_block.number,
-            "updating persistence state"
-        );
+        trace!(target: "engine::tree", block= %last_persisted_block_number, hash=%last_persisted_block_hash, "updating persistence state");
         self.rx = None;
-        self.last_persisted_block = last_persisted_block;
-        self.last_state_trie_persisted_block = last_state_trie_persisted_block;
+        self.last_persisted_block =
+            BlockNumHash::new(last_persisted_block_number, last_persisted_block_hash);
     }
 }
 

@@ -7,14 +7,14 @@ use eyre::{eyre, Result};
 use reth_chainspec::{ChainSpec, EthChainSpec, Hardforks};
 use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_commands::{
-    common::{CliComponentsBuilder, CliNodeTypes, HeaderMut},
+    common::{CliComponentsBuilder, CliHeader, CliNodeTypes},
     launcher::{FnLauncher, Launcher},
 };
 use reth_cli_runner::CliRunner;
 use reth_db::DatabaseEnv;
 use reth_node_api::NodePrimitives;
 use reth_node_builder::{NodeBuilder, WithLaunchContext};
-use reth_node_ethereum::{consensus::EthBeaconConsensus, EthereumNode};
+use reth_node_ethereum::{consensus::EthBeaconConsensus, EthEvmConfig, EthereumNode};
 use reth_node_metrics::recorder::install_prometheus_recorder;
 use reth_rpc_server_types::RpcModuleValidator;
 use reth_tasks::RayonConfig;
@@ -69,16 +69,8 @@ where
     where
         C: ChainSpecParser<ChainSpec = ChainSpec>,
     {
-        let jit_args = match &self.cli.command {
-            Commands::ReExecute(cmd) => cmd.jit.clone(),
-            _ => Default::default(),
-        };
-
-        let components = move |spec: Arc<ChainSpec>| {
-            let (evm_config, _) =
-                reth_node_ethereum::node::build_evm_config(spec.clone(), &jit_args, None)
-                    .expect("failed to start revmc JIT backend");
-            (evm_config, Arc::new(EthBeaconConsensus::new(spec)))
+        let components = |spec: Arc<ChainSpec>| {
+            (EthEvmConfig::ethereum(spec.clone()), Arc::new(EthBeaconConsensus::new(spec)))
         };
 
         self.run_with_components::<EthereumNode>(components, async move |builder, ext| {
@@ -95,12 +87,12 @@ where
         mut self,
         components: impl CliComponentsBuilder<N>,
         launcher: impl AsyncFnOnce(
-            WithLaunchContext<NodeBuilder<DatabaseEnv, C::ChainSpec>>,
+            WithLaunchContext<NodeBuilder<Arc<DatabaseEnv>, C::ChainSpec>>,
             Ext,
         ) -> Result<()>,
     ) -> Result<()>
     where
-        N: CliNodeTypes<Primitives: NodePrimitives<BlockHeader: HeaderMut>, ChainSpec: Hardforks>,
+        N: CliNodeTypes<Primitives: NodePrimitives<BlockHeader: CliHeader>, ChainSpec: Hardforks>,
         C: ChainSpecParser<ChainSpec = N::ChainSpec>,
     {
         let runner = match self.runner.take() {
@@ -163,7 +155,7 @@ pub(crate) fn run_commands_with<C, Ext, Rpc, N, SubCmd>(
     runner: CliRunner,
     components: impl CliComponentsBuilder<N>,
     launcher: impl AsyncFnOnce(
-        WithLaunchContext<NodeBuilder<DatabaseEnv, C::ChainSpec>>,
+        WithLaunchContext<NodeBuilder<Arc<DatabaseEnv>, C::ChainSpec>>,
         Ext,
     ) -> Result<()>,
 ) -> Result<()>
@@ -171,7 +163,7 @@ where
     C: ChainSpecParser<ChainSpec = N::ChainSpec>,
     Ext: clap::Args + fmt::Debug,
     Rpc: RpcModuleValidator,
-    N: CliNodeTypes<Primitives: NodePrimitives<BlockHeader: HeaderMut>, ChainSpec: Hardforks>,
+    N: CliNodeTypes<Primitives: NodePrimitives<BlockHeader: CliHeader>, ChainSpec: Hardforks>,
     SubCmd: ExtendedCommand + Subcommand + fmt::Debug,
 {
     let rt = runner.runtime();
@@ -201,8 +193,7 @@ where
         Commands::Db(command) => {
             runner.run_blocking_command_until_exit(|ctx| command.execute::<N>(ctx))
         }
-        Commands::Download(command) => runner
-            .run_blocking_until_ctrl_c(async move { command.execute::<N>().await.map(|_| ()) }),
+        Commands::Download(command) => runner.run_blocking_until_ctrl_c(command.execute::<N>()),
         Commands::SnapshotManifest(command) => command.execute(),
         Commands::Stage(command) => {
             runner.run_command_until_exit(|ctx| command.execute::<N, _>(ctx, components))

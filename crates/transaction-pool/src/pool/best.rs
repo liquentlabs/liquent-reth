@@ -17,7 +17,9 @@ use std::{
 use tokio::sync::broadcast::{error::TryRecvError, Receiver};
 use tracing::debug;
 
-const MAX_NEW_TRANSACTIONS_PER_BATCH: usize = 16;
+// liquent: 1024 (upstream: 16) — sized for pipe-exec batch-insert which feeds
+// hundreds of txs per round; see merge-v2.3.0 transaction-pool.md open question 3.
+const MAX_NEW_TRANSACTIONS_PER_BATCH: usize = 1024;
 
 /// An iterator that returns transactions that can be executed on the current state (*best*
 /// transactions).
@@ -39,10 +41,6 @@ impl<T: TransactionOrdering> crate::traits::BestTransactions for BestTransaction
 
     fn no_updates(&mut self) {
         self.best.no_updates()
-    }
-
-    fn allow_updates_out_of_order(&mut self) {
-        self.best.allow_updates_out_of_order()
     }
 
     fn skip_blobs(&mut self) {
@@ -115,8 +113,6 @@ pub struct BestTransactions<T: TransactionOrdering> {
     pub(crate) last_priority: Option<Priority<T::PriorityValue>>,
     /// Flag to control whether to skip blob transactions (EIP4844).
     pub(crate) skip_blobs: bool,
-    /// Whether live updates can be yielded after a lower-priority transaction.
-    pub(crate) allow_updates_out_of_order: bool,
 }
 
 impl<T: TransactionOrdering> BestTransactions<T> {
@@ -142,8 +138,7 @@ impl<T: TransactionOrdering> BestTransactions<T> {
         loop {
             match self.new_transaction_receiver.as_mut()?.try_recv() {
                 Ok(tx) => {
-                    if !self.allow_updates_out_of_order &&
-                        let Some(last_priority) = &self.last_priority &&
+                    if let Some(last_priority) = &self.last_priority &&
                         &tx.priority > last_priority
                     {
                         // we skip transactions if we already yielded a transaction with lower
@@ -285,10 +280,6 @@ impl<T: TransactionOrdering> crate::traits::BestTransactions for BestTransaction
         self.last_priority.take();
     }
 
-    fn allow_updates_out_of_order(&mut self) {
-        self.allow_updates_out_of_order = true;
-    }
-
     fn skip_blobs(&mut self) {
         self.set_skip_blobs(true);
     }
@@ -364,10 +355,6 @@ where
 
     fn no_updates(&mut self) {
         self.best.no_updates()
-    }
-
-    fn allow_updates_out_of_order(&mut self) {
-        self.best.allow_updates_out_of_order()
     }
 
     fn skip_blobs(&mut self) {
@@ -467,10 +454,6 @@ where
 
     fn no_updates(&mut self) {
         self.inner.no_updates()
-    }
-
-    fn allow_updates_out_of_order(&mut self) {
-        self.inner.allow_updates_out_of_order()
     }
 
     fn set_skip_blobs(&mut self, skip_blobs: bool) {
@@ -1124,23 +1107,6 @@ mod tests {
 
         // Ensure receiver is cleared
         assert!(best.new_transaction_receiver.is_none());
-    }
-
-    #[test]
-    fn test_best_transactions_yields_updates_after_empty() {
-        let mut pool = PendingPool::new(MockOrdering::default());
-        let mut best = pool.best();
-        best.allow_updates_out_of_order();
-
-        assert!(best.next().is_none());
-
-        let mut f = MockTransactionFactory::default();
-        let tx = MockTransaction::eip1559().rng_hash();
-        let valid_tx = Arc::new(f.validated(tx));
-        let expected_hash = *valid_tx.hash();
-        pool.add_transaction(valid_tx, 0);
-
-        assert_eq!(*best.next().expect("new transaction should be yielded").hash(), expected_hash);
     }
 
     #[test]

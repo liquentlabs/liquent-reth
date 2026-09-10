@@ -6,10 +6,15 @@
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
 #![allow(missing_docs, clippy::needless_pass_by_ref_mut)]
-#![cfg_attr(docsrs, feature(doc_cfg))]
-#![expect(clippy::borrow_as_ptr)]
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
+#![allow(clippy::borrow_as_ptr)]
 
 pub extern crate reth_mdbx_sys as ffi;
+
+// `txn_pool` (WIP read-transaction pool from the v2.3.0 merge checkpoint) is not yet wired into
+// the module tree, so `crossbeam-queue` — its only consumer — would trip
+// `unused_crate_dependencies`. Retain the dependency until that module lands.
+use crossbeam_queue as _;
 
 pub use crate::{
     codec::*,
@@ -35,7 +40,6 @@ mod error;
 mod flags;
 mod transaction;
 mod txn_manager;
-mod txn_pool;
 
 #[cfg(test)]
 mod test_utils {

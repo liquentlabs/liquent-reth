@@ -1,17 +1,27 @@
-use crate::tree::TreeOutcome;
+use crate::tree::{error::InsertBlockFatalError, TreeOutcome};
+use alloy_consensus::transaction::TxHashRef;
+use alloy_evm::{
+    block::{BlockExecutor, ExecutableTx},
+    Evm,
+};
 use alloy_rpc_types_engine::{PayloadStatus, PayloadStatusEnum};
-use reth_engine_primitives::{ForkchoiceStatus, InsertBlockProcessingError, OnForkChoiceUpdated};
-use reth_errors::ProviderError;
-use reth_evm::metrics::ExecutorMetrics;
+use core::borrow::BorrowMut;
+use reth_engine_primitives::{ForkchoiceStatus, OnForkChoiceUpdated};
+use reth_errors::{BlockExecutionError, ProviderError};
+use reth_evm::{metrics::ExecutorMetrics, OnStateHook, RecoveredTx};
 use reth_execution_types::BlockExecutionOutput;
 use reth_metrics::{
     metrics::{Counter, Gauge, Histogram},
-    thread::{ThreadResourceUsage, ThreadResourceUsageDelta},
     Metrics,
 };
-use reth_primitives_traits::{constants::gas_units::MEGAGAS, FastInstant as Instant};
+use reth_primitives_traits::{constants::gas_units::MEGAGAS, SignedTransaction};
 use reth_trie::updates::TrieUpdates;
-use std::time::Duration;
+use revm::{
+    database::{states::bundle_state::BundleRetention, State},
+    state::EvmState,
+};
+use std::time::{Duration, Instant};
+use tracing::{debug_span, trace};
 
 /// Upper bounds for each gas bucket. The last bucket is a catch-all for
 /// everything above the final threshold: <5M, 5-10M, 10-20M, 20-30M, 30-40M, >40M.
@@ -23,7 +33,7 @@ const NUM_GAS_BUCKETS: usize = GAS_BUCKET_THRESHOLDS.len() + 1;
 
 /// Metrics for the `EngineApi`.
 #[derive(Debug, Default)]
-pub struct EngineApiMetrics {
+pub(crate) struct EngineApiMetrics {
     /// Engine API-specific metrics.
     pub engine: EngineMetrics,
     /// Block executor metrics.
@@ -36,17 +46,22 @@ pub struct EngineApiMetrics {
     #[allow(dead_code)]
     pub(crate) bal: BalMetrics,
     /// Gas-bucketed execution sub-phase metrics.
+    #[allow(dead_code)]
     pub(crate) execution_gas_buckets: ExecutionGasBucketMetrics,
     /// Gas-bucketed block validation sub-phase metrics.
+    #[allow(dead_code)]
     pub(crate) block_validation_gas_buckets: BlockValidationGasBucketMetrics,
 }
 
+// These per-phase recording methods are currently unwired after the engine merge; kept as the
+// intended metrics API surface. See report note on orphaned engine metrics.
+#[allow(dead_code)]
 impl EngineApiMetrics {
     /// Records metrics for block execution.
     ///
     /// This method updates metrics for execution time, gas usage, and the number
     /// of accounts, storage slots and bytecodes updated.
-    pub fn record_block_execution<R>(
+    pub(crate) fn record_block_execution<R>(
         &self,
         output: &BlockExecutionOutput<R>,
         execution_duration: Duration,
@@ -73,22 +88,22 @@ impl EngineApiMetrics {
     }
 
     /// Returns a reference to the executor metrics for use in state hooks.
-    pub const fn executor_metrics(&self) -> &ExecutorMetrics {
+    pub(crate) const fn executor_metrics(&self) -> &ExecutorMetrics {
         &self.executor
     }
 
     /// Records the duration of block pre-execution changes (e.g., beacon root update).
-    pub fn record_pre_execution(&self, elapsed: Duration) {
+    pub(crate) fn record_pre_execution(&self, elapsed: Duration) {
         self.executor.pre_execution_histogram.record(elapsed);
     }
 
     /// Records the duration of block post-execution changes (e.g., finalization).
-    pub fn record_post_execution(&self, elapsed: Duration) {
+    pub(crate) fn record_post_execution(&self, elapsed: Duration) {
         self.executor.post_execution_histogram.record(elapsed);
     }
 
     /// Records execution duration into the gas-bucketed execution histogram.
-    pub fn record_block_execution_gas_bucket(&self, gas_used: u64, elapsed: Duration) {
+    pub(crate) fn record_block_execution_gas_bucket(&self, gas_used: u64, elapsed: Duration) {
         let idx = GasBucketMetrics::bucket_index(gas_used);
         self.execution_gas_buckets.buckets[idx]
             .execution_gas_bucket_histogram
@@ -96,7 +111,7 @@ impl EngineApiMetrics {
     }
 
     /// Records state root duration into the gas-bucketed block validation histogram.
-    pub fn record_state_root_gas_bucket(&self, gas_used: u64, elapsed_secs: f64) {
+    pub(crate) fn record_state_root_gas_bucket(&self, gas_used: u64, elapsed_secs: f64) {
         let idx = GasBucketMetrics::bucket_index(gas_used);
         self.block_validation_gas_buckets.buckets[idx]
             .state_root_gas_bucket_histogram
@@ -104,20 +119,126 @@ impl EngineApiMetrics {
     }
 
     /// Records the time spent waiting for the next transaction from the iterator.
-    pub fn record_transaction_wait(&self, elapsed: Duration) {
+    pub(crate) fn record_transaction_wait(&self, elapsed: Duration) {
         self.executor.transaction_wait_histogram.record(elapsed);
     }
 
     /// Records the duration of a single transaction execution.
-    pub fn record_transaction_execution(&self, elapsed: Duration) {
+    pub(crate) fn record_transaction_execution(&self, elapsed: Duration) {
         self.executor.transaction_execution_histogram.record(elapsed);
+    }
+
+    /// Helper function for metered execution
+    fn metered<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce() -> (u64, R),
+    {
+        // Execute the block and record the elapsed time.
+        let execute_start = Instant::now();
+        let (gas_used, output) = f();
+        let execution_duration = execute_start.elapsed().as_secs_f64();
+
+        // Update gas metrics.
+        self.executor.gas_processed_total.increment(gas_used);
+        self.executor.gas_per_second.set(gas_used as f64 / execution_duration);
+        self.executor.gas_used_histogram.record(gas_used as f64);
+        self.executor.execution_histogram.record(execution_duration);
+        self.executor.execution_duration.set(execution_duration);
+
+        output
+    }
+
+    /// Execute the given block using the provided [`BlockExecutor`] and update metrics for the
+    /// execution.
+    ///
+    /// This method updates metrics for execution time, gas usage, and the number
+    /// of accounts, storage slots and bytecodes loaded and updated.
+    pub(crate) fn execute_metered<E, DB>(
+        &self,
+        executor: E,
+        transactions: impl Iterator<
+            Item = Result<impl ExecutableTx<E> + RecoveredTx<E::Transaction>, BlockExecutionError>,
+        >,
+        state_hook: Box<dyn OnStateHook>,
+    ) -> Result<BlockExecutionOutput<E::Receipt>, BlockExecutionError>
+    where
+        DB: alloy_evm::Database,
+        E: BlockExecutor<Evm: Evm<DB: BorrowMut<State<DB>>>, Transaction: SignedTransaction>,
+    {
+        // clone here is cheap, all the metrics are Option<Arc<_>>. additionally
+        // they are globally registered so that the data recorded in the hook will
+        // be accessible.
+        let wrapper = MeteredStateHook { metrics: self.executor.clone(), inner_hook: state_hook };
+
+        // The state hook now lives on the revm `State` database rather than the executor.
+        let mut executor = executor;
+        executor.evm_mut().db_mut().borrow_mut().set_state_hook(Some(Box::new(wrapper)));
+
+        let f = || {
+            executor.apply_pre_execution_changes()?;
+            for tx in transactions {
+                let tx = tx?;
+                let span =
+                    debug_span!(target: "engine::tree", "execute_tx", tx_hash=?tx.tx().tx_hash());
+                let _enter = span.enter();
+                trace!(target: "engine::tree", "Executing transaction");
+                executor.execute_transaction(tx)?;
+            }
+            executor.finish().map(|(evm, result)| (evm.into_db(), result))
+        };
+
+        // Use metered to execute and track timing/gas metrics
+        let (mut db, result) = self.metered(|| {
+            let res = f();
+            let gas_used = res.as_ref().map(|r| r.1.gas_used).unwrap_or(0);
+            (gas_used, res)
+        })?;
+
+        // merge transitions into bundle state
+        db.borrow_mut().set_state_hook(None);
+        db.borrow_mut().merge_transitions(BundleRetention::Reverts);
+        let output = BlockExecutionOutput { result, state: db.borrow_mut().take_bundle() };
+
+        // Update the metrics for the number of accounts, storage slots and bytecodes updated
+        let accounts = output.state.state.len();
+        let storage_slots =
+            output.state.state.values().map(|account| account.storage.len()).sum::<usize>();
+        let bytecodes = output.state.contracts.len();
+
+        self.executor.accounts_updated_histogram.record(accounts as f64);
+        self.executor.storage_slots_updated_histogram.record(storage_slots as f64);
+        self.executor.bytecodes_updated_histogram.record(bytecodes as f64);
+
+        Ok(output)
+    }
+}
+
+/// Wrapper struct that combines metrics and state hook
+struct MeteredStateHook {
+    metrics: ExecutorMetrics,
+    inner_hook: Box<dyn OnStateHook>,
+}
+
+impl OnStateHook for MeteredStateHook {
+    fn on_state(&mut self, state: &EvmState) {
+        // Update the metrics for the number of accounts, storage slots and bytecodes loaded
+        let accounts = state.keys().len();
+        let storage_slots = state.values().map(|account| account.storage.len()).sum::<usize>();
+        let bytecodes = state.values().filter(|account| !account.info.is_empty_code_hash()).count();
+
+        self.metrics.accounts_loaded_histogram.record(accounts as f64);
+        self.metrics.storage_slots_loaded_histogram.record(storage_slots as f64);
+        self.metrics.bytecodes_loaded_histogram.record(bytecodes as f64);
+
+        // Call the original state hook
+        self.inner_hook.on_state(state);
     }
 }
 
 /// Metrics for the entire blockchain tree
 #[derive(Metrics)]
 #[metrics(scope = "blockchain_tree")]
-pub struct TreeMetrics {
+pub(crate) struct TreeMetrics {
     /// The highest block number in the canonical chain
     pub canonical_chain_height: Gauge,
     /// Metrics for reorgs.
@@ -133,7 +254,7 @@ pub struct TreeMetrics {
 
 /// Metrics for reorgs.
 #[derive(Debug)]
-pub struct ReorgMetrics {
+pub(crate) struct ReorgMetrics {
     /// The number of head block reorgs
     pub head: Counter,
     /// The number of safe block reorgs
@@ -155,7 +276,7 @@ impl Default for ReorgMetrics {
 /// Metrics for the `EngineApi`.
 #[derive(Metrics)]
 #[metrics(scope = "consensus.engine.beacon")]
-pub struct EngineMetrics {
+pub(crate) struct EngineMetrics {
     /// Engine API forkchoiceUpdated response type metrics
     #[metric(skip)]
     pub(crate) forkchoice_updated: ForkchoiceUpdatedMetrics,
@@ -340,6 +461,7 @@ pub(crate) struct ExecutionGasBucketSeries {
 /// Holds pre-initialized [`ExecutionGasBucketSeries`] instances, one per gas bucket.
 #[derive(Debug)]
 pub(crate) struct ExecutionGasBucketMetrics {
+    #[allow(dead_code)]
     buckets: [ExecutionGasBucketSeries; NUM_GAS_BUCKETS],
 }
 
@@ -365,6 +487,7 @@ pub(crate) struct BlockValidationGasBucketSeries {
 /// Holds pre-initialized [`BlockValidationGasBucketSeries`] instances, one per gas bucket.
 #[derive(Debug)]
 pub(crate) struct BlockValidationGasBucketMetrics {
+    #[allow(dead_code)]
     buckets: [BlockValidationGasBucketSeries; NUM_GAS_BUCKETS],
 }
 
@@ -392,9 +515,6 @@ pub(crate) struct NewPayloadStatusMetrics {
     /// Gas-bucket-labeled latency and gas/s histograms.
     #[metric(skip)]
     pub(crate) gas_bucket: GasBucketMetrics,
-    /// Resource usage on the engine thread while processing new payloads.
-    #[metric(skip)]
-    thread_resource_usage: NewPayloadThreadResourceMetrics,
     /// The total count of new payload messages received.
     pub(crate) new_payload_messages: Counter,
     /// The total count of new payload messages that we responded to with
@@ -433,17 +553,12 @@ pub(crate) struct NewPayloadStatusMetrics {
 }
 
 impl NewPayloadStatusMetrics {
-    /// Starts measuring resource usage on the current thread.
-    pub(crate) fn measure_thread_resource_usage(&self) -> NewPayloadThreadResourceGuard {
-        self.thread_resource_usage.measure()
-    }
-
     /// Increment the newPayload counter based on the given result
     pub(crate) fn update_response_metrics(
         &mut self,
         start: Instant,
         latest_forkchoice_updated_at: &mut Option<Instant>,
-        result: &Result<TreeOutcome<PayloadStatus>, InsertBlockProcessingError>,
+        result: &Result<TreeOutcome<PayloadStatus>, InsertBlockFatalError>,
         gas_used: u64,
     ) {
         let finish = Instant::now();
@@ -487,64 +602,6 @@ impl NewPayloadStatusMetrics {
     }
 }
 
-/// Per-newPayload engine thread resource usage metrics.
-#[derive(Clone, Metrics)]
-#[metrics(scope = "consensus.engine.beacon")]
-struct NewPayloadThreadResourceMetrics {
-    /// User-mode CPU time used while processing a new payload.
-    new_payload_thread_user_cpu_seconds: Histogram,
-    /// Kernel-mode CPU time used while processing a new payload.
-    new_payload_thread_system_cpu_seconds: Histogram,
-    /// Minor page faults incurred while processing a new payload.
-    new_payload_thread_minor_page_faults: Histogram,
-    /// Major page faults incurred while processing a new payload.
-    new_payload_thread_major_page_faults: Histogram,
-    /// Voluntary context switches while processing a new payload.
-    new_payload_thread_voluntary_context_switches: Histogram,
-    /// Involuntary context switches while processing a new payload.
-    new_payload_thread_involuntary_context_switches: Histogram,
-    /// Block input operations while processing a new payload.
-    new_payload_thread_block_input_operations: Histogram,
-    /// Block output operations while processing a new payload.
-    new_payload_thread_block_output_operations: Histogram,
-}
-
-impl NewPayloadThreadResourceMetrics {
-    fn measure(&self) -> NewPayloadThreadResourceGuard {
-        let metrics = self.clone();
-        let start = ThreadResourceUsage::now();
-        NewPayloadThreadResourceGuard { start, metrics }
-    }
-
-    fn record(&self, usage: &ThreadResourceUsageDelta) {
-        self.new_payload_thread_user_cpu_seconds.record(usage.user_cpu_time);
-        self.new_payload_thread_system_cpu_seconds.record(usage.system_cpu_time);
-        self.new_payload_thread_minor_page_faults.record(usage.minor_page_faults as f64);
-        self.new_payload_thread_major_page_faults.record(usage.major_page_faults as f64);
-        self.new_payload_thread_voluntary_context_switches
-            .record(usage.voluntary_context_switches as f64);
-        self.new_payload_thread_involuntary_context_switches
-            .record(usage.involuntary_context_switches as f64);
-        self.new_payload_thread_block_input_operations.record(usage.block_input_operations as f64);
-        self.new_payload_thread_block_output_operations
-            .record(usage.block_output_operations as f64);
-    }
-}
-
-/// Records engine thread resource usage when dropped.
-pub(crate) struct NewPayloadThreadResourceGuard {
-    start: ThreadResourceUsage,
-    metrics: NewPayloadThreadResourceMetrics,
-}
-
-impl Drop for NewPayloadThreadResourceGuard {
-    fn drop(&mut self) {
-        if let Some(usage) = self.start.elapsed() {
-            self.metrics.record(&usage);
-        }
-    }
-}
-
 /// Metrics for EIP-7928 Block-Level Access Lists (BAL).
 ///
 /// See also <https://github.com/ethereum/execution-metrics/issues/5>
@@ -575,9 +632,11 @@ pub(crate) struct BalMetrics {
 /// Metrics for non-execution related block validation.
 #[derive(Metrics, Clone)]
 #[metrics(scope = "sync.block_validation")]
-pub struct BlockValidationMetrics {
+pub(crate) struct BlockValidationMetrics {
     /// Total number of storage tries updated in the state root calculation
     pub state_root_storage_tries_updated_total: Counter,
+    /// Total number of times the parallel state root computation fell back to regular.
+    pub state_root_parallel_fallback_total: Counter,
     /// Total number of times the state root task failed but the fallback succeeded.
     pub state_root_task_fallback_success_total: Counter,
     /// Total number of times the state root task timed out and a sequential fallback was spawned.
@@ -586,6 +645,8 @@ pub struct BlockValidationMetrics {
     pub state_root_duration: Gauge,
     /// Histogram for state root duration ie the time spent blocked waiting for the state root
     pub state_root_histogram: Histogram,
+    /// Trie input computation duration
+    pub trie_input_duration: Histogram,
     /// Histogram of deferred trie computation duration.
     pub deferred_trie_compute_duration: Histogram,
     /// Payload conversion and validation latency
@@ -606,7 +667,7 @@ pub struct BlockValidationMetrics {
 
 impl BlockValidationMetrics {
     /// Records a new state root time, updating both the histogram and state root gauge
-    pub fn record_state_root(&self, trie_output: &TrieUpdates, elapsed_as_secs: f64) {
+    pub(crate) fn record_state_root(&self, trie_output: &TrieUpdates, elapsed_as_secs: f64) {
         self.state_root_storage_tries_updated_total
             .increment(trie_output.storage_tries_ref().len() as u64);
         self.state_root_duration.set(elapsed_as_secs);
@@ -615,7 +676,7 @@ impl BlockValidationMetrics {
 
     /// Records a new payload validation time, updating both the histogram and the payload
     /// validation gauge
-    pub fn record_payload_validation(&self, elapsed_as_secs: f64) {
+    pub(crate) fn record_payload_validation(&self, elapsed_as_secs: f64) {
         self.payload_validation_duration.set(elapsed_as_secs);
         self.payload_validation_histogram.record(elapsed_as_secs);
     }
@@ -666,33 +727,19 @@ mod tests {
         };
 
         metrics.record_block_execution(&output, Duration::from_millis(100));
-        metrics.engine.new_payload.thread_resource_usage.record(&ThreadResourceUsageDelta {
-            user_cpu_time: Duration::from_millis(1),
-            system_cpu_time: Duration::from_millis(2),
-            minor_page_faults: 3,
-            major_page_faults: 4,
-            voluntary_context_switches: 5,
-            involuntary_context_switches: 6,
-            block_input_operations: 7,
-            block_output_operations: 8,
-        });
 
         let snapshot = snapshotter.snapshot().into_vec();
 
         // Verify that metrics were registered
-        let mut found_execution_metrics = false;
-        let mut found_thread_resource_metrics = false;
+        let mut found_metrics = false;
         for (key, _unit, _desc, _value) in snapshot {
             let metric_name = key.key().name();
             if metric_name.starts_with("sync.execution") {
-                found_execution_metrics = true;
-            }
-            if metric_name == "consensus.engine.beacon.new_payload_thread_major_page_faults" {
-                found_thread_resource_metrics = true;
+                found_metrics = true;
+                break;
             }
         }
 
-        assert!(found_execution_metrics, "Expected to find sync.execution metrics");
-        assert!(found_thread_resource_metrics, "Expected to find thread resource metrics");
+        assert!(found_metrics, "Expected to find sync.execution metrics");
     }
 }

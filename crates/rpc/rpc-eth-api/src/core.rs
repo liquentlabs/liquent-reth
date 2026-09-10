@@ -18,9 +18,8 @@ use alloy_serde::JsonStorageKey;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth_primitives_traits::TxTy;
 use reth_rpc_convert::RpcTxReq;
-use reth_rpc_eth_types::{EthApiError, EthCapabilities, FillTransaction};
+use reth_rpc_eth_types::{EthCapabilities, FillTransaction};
 use reth_rpc_server_types::{result::internal_rpc_err, ToRpcResult};
-use serde_json::Value;
 use std::collections::HashMap;
 use tracing::trace;
 
@@ -385,11 +384,7 @@ pub trait EthApi<
     ///
     /// This will return a timeout error if the transaction isn't included within some time period.
     #[method(name = "sendRawTransactionSync")]
-    async fn send_raw_transaction_sync(
-        &self,
-        bytes: Bytes,
-        timeout_ms: Option<u64>,
-    ) -> RpcResult<R>;
+    async fn send_raw_transaction_sync(&self, bytes: Bytes) -> RpcResult<R>;
 
     /// Returns an Ethereum specific signature with: sign(keccak256("\x19Ethereum Signed Message:\n"
     /// + len(message) + message))).
@@ -415,14 +410,6 @@ pub trait EthApi<
         block_number: Option<BlockId>,
     ) -> RpcResult<EIP1186AccountProofResponse>;
 
-    /// Returns the account and storage values of the specified targets including Merkle proofs.
-    #[method(name = "getMultiProof")]
-    async fn get_multi_proof(
-        &self,
-        targets: Vec<(Address, Vec<B256>)>,
-        block_number: Option<BlockId>,
-    ) -> RpcResult<Vec<EIP1186AccountProofResponse>>;
-
     /// Returns the account's balance, nonce, and code.
     ///
     /// This is similar to `eth_getAccount` but does not return the storage root.
@@ -432,25 +419,6 @@ pub trait EthApi<
         address: Address,
         block: BlockId,
     ) -> RpcResult<alloy_rpc_types_eth::AccountInfo>;
-
-    /// Returns the EIP-7928 block access list for a block by hash.
-    #[method(name = "getBlockAccessListByBlockHash")]
-    async fn block_access_list_by_block_hash(&self, hash: B256) -> RpcResult<Option<Value>>;
-
-    /// Returns the EIP-7928 block access list for a block by number.
-    #[method(name = "getBlockAccessListByBlockNumber")]
-    async fn block_access_list_by_block_number(
-        &self,
-        number: BlockNumberOrTag,
-    ) -> RpcResult<Option<Value>>;
-
-    /// Returns the EIP-7928 block access list for a given block id.
-    #[method(name = "getBlockAccessList")]
-    async fn block_access_list(&self, block_id: BlockId) -> RpcResult<Option<Value>>;
-
-    /// Returns the EIP-7928 block access list bytes for a block by number.
-    #[method(name = "getBlockAccessListRaw")]
-    async fn block_access_list_raw(&self, block: BlockId) -> RpcResult<Option<Bytes>>;
 }
 
 #[async_trait::async_trait]
@@ -924,13 +892,9 @@ where
     }
 
     /// Handler for: `eth_sendRawTransactionSync`
-    async fn send_raw_transaction_sync(
-        &self,
-        tx: Bytes,
-        timeout_ms: Option<u64>,
-    ) -> RpcResult<RpcReceipt<T::NetworkTypes>> {
-        trace!(target: "rpc::eth", ?tx, ?timeout_ms, "Serving eth_sendRawTransactionSync");
-        Ok(EthTransactions::send_raw_transaction_sync(self, tx, timeout_ms).await?)
+    async fn send_raw_transaction_sync(&self, tx: Bytes) -> RpcResult<RpcReceipt<T::NetworkTypes>> {
+        trace!(target: "rpc::eth", ?tx, "Serving eth_sendRawTransactionSync");
+        Ok(EthTransactions::send_raw_transaction_sync(self, tx).await?)
     }
 
     /// Handler for: `eth_sign`
@@ -962,16 +926,6 @@ where
         Ok(EthState::get_proof(self, address, keys, block_number)?.await?)
     }
 
-    /// Handler for: `eth_getMultiProof`
-    async fn get_multi_proof(
-        &self,
-        targets: Vec<(Address, Vec<B256>)>,
-        block_number: Option<BlockId>,
-    ) -> RpcResult<Vec<EIP1186AccountProofResponse>> {
-        trace!(target: "rpc::eth", ?targets, ?block_number, "Serving eth_getMultiProof");
-        Ok(EthState::get_multi_proof(self, targets, block_number)?.await?)
-    }
-
     /// Handler for: `eth_getAccountInfo`
     async fn get_account_info(
         &self,
@@ -980,48 +934,5 @@ where
     ) -> RpcResult<alloy_rpc_types_eth::AccountInfo> {
         trace!(target: "rpc::eth", "Serving eth_getAccountInfo");
         Ok(EthState::get_account_info(self, address, block).await?)
-    }
-
-    /// Handler for: `eth_getBlockAccessListByBlockHash`
-    async fn block_access_list_by_block_hash(&self, block_hash: B256) -> RpcResult<Option<Value>> {
-        trace!(target: "rpc::eth", ?block_hash, "Serving eth_getBlockAccessListByBlockHash");
-
-        let bal = self.get_block_access_list(block_hash.into()).await?;
-        let json = serde_json::to_value(&bal)
-            .map_err(|e| EthApiError::Internal(reth_errors::RethError::msg(e.to_string())))?;
-
-        Ok(Some(json))
-    }
-
-    /// Handler for: `eth_getBlockAccessListByBlockNumber`
-    async fn block_access_list_by_block_number(
-        &self,
-        number: BlockNumberOrTag,
-    ) -> RpcResult<Option<Value>> {
-        trace!(target: "rpc::eth", ?number, "Serving eth_getBlockAccessListByBlockNumber");
-
-        let bal = self.get_block_access_list(number.into()).await?;
-        let json = serde_json::to_value(&bal)
-            .map_err(|e| EthApiError::Internal(reth_errors::RethError::msg(e.to_string())))?;
-
-        Ok(Some(json))
-    }
-
-    /// Handler for: `eth_getBlockAccessList`
-    async fn block_access_list(&self, block_id: BlockId) -> RpcResult<Option<Value>> {
-        trace!(target: "rpc::eth", ?block_id, "Serving eth_getBlockAccessList");
-
-        let bal = self.get_block_access_list(block_id).await?;
-        let json = serde_json::to_value(&bal)
-            .map_err(|e| EthApiError::Internal(reth_errors::RethError::msg(e.to_string())))?;
-
-        Ok(Some(json))
-    }
-
-    /// Handler for: `eth_getBlockAccessListRaw`
-    async fn block_access_list_raw(&self, block: BlockId) -> RpcResult<Option<Bytes>> {
-        trace!(target: "rpc::eth", ?block, "Serving eth_getBlockAccessListRaw");
-
-        Ok(self.get_raw_block_access_list(block).await?)
     }
 }

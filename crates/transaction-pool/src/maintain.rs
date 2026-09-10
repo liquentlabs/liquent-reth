@@ -9,7 +9,7 @@ use crate::{
     TransactionOrigin,
 };
 use alloy_consensus::{transaction::TxHashRef, BlockHeader, Typed2718};
-use alloy_eips::{BlockNumberOrTag, Decodable2718};
+use alloy_eips::{BlockNumberOrTag, Decodable2718, Encodable2718};
 use alloy_primitives::{
     map::{AddressSet, HashSet},
     Address, BlockHash, BlockNumber, Bytes,
@@ -19,10 +19,12 @@ use futures_util::{
     future::{BoxFuture, Fuse, FusedFuture},
     FutureExt, Stream, StreamExt,
 };
+use liquent_primitives::get_liquent_config;
 use reth_chain_state::CanonStateNotification;
 use reth_chainspec::{ChainSpecProvider, EthChainSpec, EthereumHardforks};
 use reth_execution_types::ChangedAccount;
 use reth_fs_util::FsPathError;
+use reth_pipe_exec_layer_event_bus::get_pipe_exec_layer_event_bus;
 use reth_primitives_traits::{
     transaction::signed::SignedTransaction, NodePrimitives, SealedHeader,
 };
@@ -179,6 +181,20 @@ pub async fn maintain_transaction_pool<N, Client, P, St>(
 
     // toggle for the first notification
     let mut first_event = true;
+
+    // liquent: subscribe to pipe-exec discarded txs so consensus-rejected transactions
+    // are evicted from the pool (see merge-v2.3.0 transaction-pool.md open question 2)
+    if !get_liquent_config().disable_pipe_execution {
+        let pool = pool.clone();
+        task_spawner.spawn_task(async move {
+            let mut discard_txs_rx =
+                get_pipe_exec_layer_event_bus().discard_txs.lock().await.take().unwrap();
+            while let Some(discard_txs) = discard_txs_rx.recv().await {
+                debug!(target: "txpool", count=%discard_txs.len(), "discarding transactions");
+                pool.remove_transactions(discard_txs);
+            }
+        });
+    }
 
     // The update loop that waits for new blocks and reorgs and performs pool updated
     // Listen for new chain events and derive the update action for the pool
@@ -380,17 +396,14 @@ pub async fn maintain_transaction_pool<N, Client, P, St>(
                 changed_accounts.extend(new_changed_accounts.into_iter().map(|entry| entry.0));
 
                 // all transactions mined in the new chain
-                let mined_transactions = new_blocks.transaction_hashes_vec();
-                let new_mined_transactions =
-                    mined_transactions.iter().copied().collect::<HashSet<_>>();
+                let new_mined_transactions: HashSet<_> = new_blocks.transaction_hashes().collect();
 
                 // update the pool then re-inject the pruned transactions
                 // find all transactions that were mined in the old chain but not in the new chain
                 let pruned_old_transactions = old_blocks
-                    .transactions_with_sender()
-                    .filter(|(_, tx)| !new_mined_transactions.contains(tx.tx_hash()))
-                    .filter_map(|(signer, tx)| {
-                        let tx = tx.clone().with_signer(*signer);
+                    .transactions_ecrecovered()
+                    .filter(|tx| !new_mined_transactions.contains(tx.tx_hash()))
+                    .filter_map(|tx| {
                         if tx.is_eip4844() {
                             // reorged blobs no longer include the blob, which is necessary for
                             // validating the transaction. Even though the transaction could have
@@ -419,7 +432,7 @@ pub async fn maintain_transaction_pool<N, Client, P, St>(
                     pending_block_blob_fee,
                     changed_accounts,
                     // all transactions mined in the new chain need to be removed from the pool
-                    mined_transactions,
+                    mined_transactions: new_blocks.transaction_hashes().collect(),
                     update_kind: PoolUpdateKind::Reorg,
                 };
                 pool.on_canonical_state_change(update);
@@ -486,7 +499,7 @@ pub async fn maintain_transaction_pool<N, Client, P, St>(
                     changed_accounts.push(acc);
                 }
 
-                let mined_transactions = blocks.transaction_hashes_vec();
+                let mined_transactions: Vec<_> = blocks.transaction_hashes().collect();
 
                 // check if the range of the commit is canonical with the pool's block
                 if first_block.parent_hash() != pool_info.last_seen_block_hash {
@@ -770,7 +783,12 @@ where
 
     let local_transactions = local_transactions
         .into_iter()
-        .map(|tx| TxBackup { rlp: tx.encoded_2718_consensus(), origin: tx.origin })
+        .map(|tx| {
+            let consensus_tx = tx.to_consensus().into_inner();
+            let rlp_data = consensus_tx.encoded_2718();
+
+            TxBackup { rlp: rlp_data.into(), origin: tx.origin }
+        })
         .collect::<Vec<_>>();
 
     let json_data = match serde_json::to_string(&local_transactions) {
@@ -881,7 +899,15 @@ mod tests {
             "02f87201830655c2808505ef61f08482565f94388c818ca8b9251b393131c08a736a67ccb192978801049e39c4b5b1f580c001a01764ace353514e8abdfb92446de356b260e3c1225b73fc4c8876a6258d12a129a04f02294aa61ca7676061cd99f29275491218b4754b46a0248e5e42bc5091f507"
         );
         let tx = PooledTransactionVariant::decode_2718(&mut &tx_bytes[..]).unwrap();
-        let provider = MockEthProvider::default().with_genesis_block();
+        // seed genesis block (MockEthProvider::with_genesis_block was a v2.3.0-only
+        // helper; provider was restored to liquent baseline which lacks it)
+        let provider = MockEthProvider::default();
+        let genesis_hash = provider.chain_spec.genesis_hash();
+        let genesis_header = provider.chain_spec.genesis_header().clone();
+        provider.add_block(
+            genesis_hash,
+            reth_ethereum_primitives::Block::new(genesis_header, Default::default()),
+        );
         let transaction = EthPooledTransaction::from_pooled(tx.try_into_recovered().unwrap());
         let tx_to_cmp = transaction.clone();
         let sender = hex!("1f9090aaE28b8a3dCeaDf281B0F12828e676c326").into();

@@ -1,12 +1,16 @@
 //! Collection of methods for block validation.
 
-use alloy_consensus::{BlockHeader as _, EMPTY_OMMER_ROOT_HASH};
-use alloy_eips::{eip4844::DATA_GAS_PER_BLOB, eip7840::BlobParams};
+use alloy_consensus::{BlockHeader as _, Transaction, EMPTY_OMMER_ROOT_HASH};
+use alloy_eips::{eip1559::INITIAL_BASE_FEE, eip4844::DATA_GAS_PER_BLOB, eip7840::BlobParams};
 use alloy_primitives::B256;
 use reth_chainspec::{EthChainSpec, EthereumHardfork, EthereumHardforks};
-use reth_consensus::ConsensusError;
+use reth_consensus::{ConsensusError, TxGasLimitTooHighErr};
 use reth_primitives_traits::{
-    constants::{GAS_LIMIT_BOUND_DIVISOR, MAXIMUM_GAS_LIMIT_BLOCK, MINIMUM_GAS_LIMIT},
+    constants::{
+        GAS_LIMIT_BOUND_DIVISOR, LIQUENT_TX_GAS_LIMIT_CAP, MAXIMUM_GAS_LIMIT_BLOCK,
+        MINIMUM_GAS_LIMIT,
+    },
+    transaction::TxHashRef,
     Block, BlockBody, BlockHeader, GotExpected, SealedBlock, SealedHeader,
 };
 
@@ -190,6 +194,8 @@ where
 ///   information about the specific checks in [`validate_shanghai_withdrawals`].
 /// * EIP-4844 blob gas validation, if cancun is active based on the given chainspec. See more
 ///   information about the specific checks in [`validate_cancun_gas`].
+/// * Per-tx gas cap validation (Liquent's Monad-style [`LIQUENT_TX_GAS_LIMIT_CAP`] in place of
+///   EIP-7825's `2^24`), if osaka is active based on the given chainspec.
 /// * EIP-7934 block size limit validation, if osaka is active based on the given chainspec.
 pub fn post_merge_hardfork_fields<B, ChainSpec>(
     block: &SealedBlock<B>,
@@ -220,13 +226,28 @@ where
         validate_cancun_gas(block)?;
     }
 
-    if chain_spec.is_osaka_active_at_timestamp(block.timestamp()) &&
-        block.rlp_length() > MAX_RLP_BLOCK_SIZE
-    {
-        return Err(ConsensusError::BlockTooLarge {
-            rlp_length: block.rlp_length(),
-            max_rlp_length: MAX_RLP_BLOCK_SIZE,
-        })
+    if chain_spec.is_osaka_active_at_timestamp(block.timestamp()) {
+        // Per-tx gas cap. Liquent uses a Monad-style flat cap (`LIQUENT_TX_GAS_LIMIT_CAP` = 30M)
+        // in place of the EIP-7825 `2^24`, so the 30M system transactions clear it. Must match
+        // the executor cfg (`reth-evm-ethereum`) and the pipe `tx_filter` guard, or a
+        // self-produced block admitted by one path is rejected on another (sync brick).
+        for tx in block.body().transactions() {
+            if tx.gas_limit() > LIQUENT_TX_GAS_LIMIT_CAP {
+                return Err(TxGasLimitTooHighErr {
+                    tx_hash: *tx.tx_hash(),
+                    gas_limit: tx.gas_limit(),
+                    max_allowed: LIQUENT_TX_GAS_LIMIT_CAP,
+                }
+                .into());
+            }
+        }
+        // EIP-7934: block size limit
+        if block.rlp_length() > MAX_RLP_BLOCK_SIZE {
+            return Err(ConsensusError::BlockTooLarge {
+                rlp_length: block.rlp_length(),
+                max_rlp_length: MAX_RLP_BLOCK_SIZE,
+            })
+        }
     }
 
     Ok(())
@@ -330,7 +351,7 @@ pub fn validate_against_parent_eip1559_base_fee<ChainSpec: EthChainSpec + Ethere
             .ethereum_fork_activation(EthereumHardfork::London)
             .transitions_at_block(header.number())
         {
-            alloy_eips::eip1559::INITIAL_BASE_FEE
+            INITIAL_BASE_FEE
         } else {
             chain_spec
                 .next_block_base_fee(parent, header.timestamp())

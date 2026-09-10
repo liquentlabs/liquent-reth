@@ -1,7 +1,6 @@
 use crate::StreamBackfillJob;
 use reth_evm::ConfigureEvm;
 use std::{
-    collections::BTreeMap,
     ops::RangeInclusive,
     time::{Duration, Instant},
 };
@@ -149,7 +148,7 @@ where
             executor.into_state().take_bundle(),
             results,
         );
-        let chain = Chain::new(blocks, outcome, BTreeMap::new());
+        let chain = Chain::new(blocks, outcome, None);
         Ok(chain)
     }
 }
@@ -287,8 +286,7 @@ mod tests {
         assert_eq!(chains.len(), 1);
         let mut chain = chains.into_iter().next().unwrap();
         chain.execution_outcome_mut().bundle.reverts.sort();
-        assert_eq!(chain.blocks().len(), 1);
-        assert_eq!(chain.blocks().get(&1).map(|block| block.as_ref()), Some(block));
+        assert_eq!(chain.blocks(), &[(1, block.clone())].into());
         assert_eq!(chain.execution_outcome(), &execution_outcome);
 
         Ok(())
@@ -438,11 +436,7 @@ mod tests {
         for (i, (pipeline_block, pipeline_output)) in pipeline_results.iter().enumerate() {
             let block_number = pipeline_block.number();
             let chain_block = chain.blocks().get(&block_number).expect("block should be in chain");
-            assert_eq!(
-                chain_block.as_ref(),
-                pipeline_block,
-                "block {i}: block mismatch in batch backfill"
-            );
+            assert_eq!(chain_block, pipeline_block, "block {i}: block mismatch in batch backfill");
 
             let chain_receipts = &chain.execution_outcome().receipts[i];
             assert_eq!(
@@ -487,14 +481,12 @@ mod tests {
 
         let mut chain1 = chains[0].clone();
         chain1.execution_outcome_mut().bundle.reverts.sort();
-        assert_eq!(chain1.blocks().len(), 1);
-        assert_eq!(chain1.blocks().get(&1).map(|block| block.as_ref()), Some(&block1));
+        assert_eq!(chain1.blocks(), &[(1, block1)].into());
         assert_eq!(chain1.execution_outcome(), &to_execution_outcome(1, &output1));
 
         let mut chain2 = chains[1].clone();
         chain2.execution_outcome_mut().bundle.reverts.sort();
-        assert_eq!(chain2.blocks().len(), 1);
-        assert_eq!(chain2.blocks().get(&2).map(|block| block.as_ref()), Some(&block2));
+        assert_eq!(chain2.blocks(), &[(2, block2)].into());
         assert_eq!(chain2.execution_outcome(), &to_execution_outcome(2, &output2));
 
         Ok(())

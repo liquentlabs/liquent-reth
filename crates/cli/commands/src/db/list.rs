@@ -3,11 +3,11 @@ use alloy_primitives::hex;
 use clap::{builder::RangedU64ValueParser, Parser};
 use eyre::WrapErr;
 use reth_chainspec::EthereumHardforks;
-use reth_db::{transaction::DbTx, DatabaseEnv};
+use reth_db::DatabaseEnv;
 use reth_db_api::{database::Database, table::Table, RawValue, TableViewer, Tables};
 use reth_db_common::{DbTool, ListFilter};
 use reth_node_builder::{NodeTypes, NodeTypesWithDBAdapter};
-use std::cell::RefCell;
+use std::{cell::RefCell, sync::Arc};
 use tracing::error;
 
 #[derive(Parser, Debug)]
@@ -55,7 +55,7 @@ impl Command {
     /// Execute `db list` command
     pub fn execute<N: NodeTypes<ChainSpec: EthereumHardforks>>(
         self,
-        tool: &DbTool<NodeTypesWithDBAdapter<N, DatabaseEnv>>,
+        tool: &DbTool<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>>,
     ) -> eyre::Result<()> {
         self.table.view(&ListTableViewer { tool, args: &self })
     }
@@ -89,7 +89,7 @@ impl Command {
 }
 
 struct ListTableViewer<'a, N: NodeTypes> {
-    tool: &'a DbTool<NodeTypesWithDBAdapter<N, DatabaseEnv>>,
+    tool: &'a DbTool<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>>,
     args: &'a Command,
 }
 
@@ -98,12 +98,7 @@ impl<N: NodeTypes> TableViewer<()> for ListTableViewer<'_, N> {
 
     fn view<T: Table>(&self) -> Result<(), Self::Error> {
         self.tool.provider_factory.db_ref().view(|tx| {
-            // We may be using the tui for a long time
-            tx.disable_long_read_transaction_safety();
-
-            let table_db = tx.inner().open_db(Some(self.args.table.name())).wrap_err("Could not open db.")?;
-                    let stats = tx.inner().db_stat(table_db.dbi()).wrap_err(format!("Could not find table: {}", self.args.table.name()))?;
-            let total_entries = stats.entries();
+            let total_entries = tx.table_entries(self.args.table.name()).wrap_err("Could not open db.")?;
             let final_entry_idx = total_entries.saturating_sub(1);
             if self.args.skip > final_entry_idx {
                 error!(

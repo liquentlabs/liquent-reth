@@ -141,30 +141,14 @@ impl StateProofProvider for StateProviderTest {
         unimplemented!("proof generation is not supported")
     }
 
-    fn multiproof_v2(
-        &self,
-        _input: TrieInput,
-        _targets: reth_trie::MultiProofTargetsV2,
-    ) -> ProviderResult<reth_trie::DecodedMultiProofV2> {
-        unimplemented!("proof generation is not supported")
-    }
-
-    fn witness(
-        &self,
-        _input: TrieInput,
-        _target: HashedPostState,
-        _mode: reth_trie::ExecutionWitnessMode,
-    ) -> ProviderResult<Vec<Bytes>> {
+    fn witness(&self, _input: TrieInput, _target: HashedPostState) -> ProviderResult<Vec<Bytes>> {
         unimplemented!("witness generation is not supported")
     }
 }
 
 impl HashedPostStateProvider for StateProviderTest {
-    fn hashed_post_state(
-        &self,
-        bundle_state: &revm::database::BundleState,
-    ) -> ProviderResult<HashedPostState> {
-        Ok(HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle_state.state()))
+    fn hashed_post_state(&self, bundle_state: &revm::database::BundleState) -> HashedPostState {
+        HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle_state.state())
     }
 }
 

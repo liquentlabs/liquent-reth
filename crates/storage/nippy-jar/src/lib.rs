@@ -14,7 +14,6 @@
 
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
-use smallvec::SmallVec;
 use std::{
     error::Error as StdError,
     fs::File,
@@ -65,10 +64,7 @@ pub const CHANGESET_OFFSETS_FILE_EXTENSION: &str = "csoff";
 
 /// A [`RefRow`] is a list of column value slices pointing to either an internal buffer or a
 /// memory-mapped file.
-///
-/// The inline capacity covers every segment used by reth (at most three columns), so reading a row
-/// does not allocate.
-pub type RefRow<'a> = SmallVec<[&'a [u8]; 4]>;
+type RefRow<'a> = Vec<&'a [u8]>;
 
 /// Alias type for a column value wrapped in `Result`.
 pub type ColumnResult<T> = Result<T, Box<dyn StdError + Send + Sync>>;

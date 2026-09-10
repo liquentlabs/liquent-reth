@@ -5,19 +5,19 @@ use reth_db_api::{database::Database, table::TableImporter, tables};
 use reth_db_common::DbTool;
 use reth_node_core::dirs::{ChainPath, DataDirPath};
 use reth_provider::{
-    providers::{ProviderNodeTypes, RocksDBProvider, StaticFileProvider},
+    providers::{ProviderNodeTypes, StaticFileProvider},
     DatabaseProviderFactory, ProviderFactory,
 };
 use reth_stages::{stages::StorageHashingStage, Stage, StageCheckpoint, UnwindInput};
+use std::sync::Arc;
 use tracing::info;
 
-pub(crate) async fn dump_hashing_storage_stage<N: ProviderNodeTypes<DB = DatabaseEnv>>(
+pub(crate) async fn dump_hashing_storage_stage<N: ProviderNodeTypes<DB = Arc<DatabaseEnv>>>(
     db_tool: &DbTool<N>,
     from: u64,
     to: u64,
     output_datadir: ChainPath<DataDirPath>,
     should_run: bool,
-    runtime: reth_tasks::Runtime,
 ) -> Result<()> {
     let (output_db, tip_block_number) = setup(from, to, &output_datadir.db(), db_tool)?;
 
@@ -26,12 +26,10 @@ pub(crate) async fn dump_hashing_storage_stage<N: ProviderNodeTypes<DB = Databas
     if should_run {
         dry_run(
             ProviderFactory::<N>::new(
-                output_db,
+                Arc::new(output_db),
                 db_tool.chain(),
                 StaticFileProvider::read_write(output_datadir.static_files())?,
-                RocksDBProvider::builder(output_datadir.rocksdb()).build()?,
-                runtime,
-            )?,
+            ),
             to,
             from,
         )?;
@@ -90,7 +88,7 @@ fn dry_run<N: ProviderNodeTypes>(
             checkpoint: Some(StageCheckpoint::new(from)),
         };
         if stage.execute(&provider, input)?.done {
-            break
+            break;
         }
     }
 

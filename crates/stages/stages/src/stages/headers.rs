@@ -17,8 +17,8 @@ use reth_network_p2p::headers::{
 };
 use reth_primitives_traits::{FullBlockHeader, HeaderTy, NodePrimitives, SealedHeader};
 use reth_provider::{
-    providers::StaticFileWriter, BlockHashReader, DBProvider, HeaderSyncGapProvider,
-    StaticFileProviderFactory,
+    providers::StaticFileWriter, BlockHashReader, DBProvider, HeaderProvider,
+    HeaderSyncGapProvider, StaticFileProviderFactory,
 };
 use reth_stages_api::{
     CheckpointBlockRange, EntitiesCheckpoint, ExecInput, ExecOutput, HeadersCheckpoint, Stage,
@@ -115,6 +115,14 @@ where
             .get_highest_static_file_block(StaticFileSegment::Headers)
             .unwrap_or_default();
 
+        // Find the latest total difficulty
+        let mut td =
+            static_file_provider.header_td_by_number(last_header_number)?.ok_or_else(|| {
+                StageError::Fatal(
+                    format!("total difficulty not found for block {last_header_number}").into(),
+                )
+            })?;
+
         // Although headers were downloaded in reverse order, the collector iterates it in ascending
         // order
         let mut writer = static_file_provider.latest_writer(StaticFileSegment::Headers)?;
@@ -123,7 +131,7 @@ where
             let (_, header_buf) = header?;
 
             if index > 0 && index.is_multiple_of(interval) && total_headers > 100 {
-                info!(target: "sync::stages::headers", progress = %format_args!("{:.2}%", (index as f64 / total_headers as f64) * 100.0), "Writing headers");
+                info!(target: "sync::stages::headers", progress = %format!("{:.2}%", (index as f64 / total_headers as f64) * 100.0), "Writing headers");
             }
 
             let sealed_header: SealedHeader<Downloader::Header> = SealedHeader::new_unhashed(
@@ -137,8 +145,11 @@ where
             }
             last_header_number = header.number();
 
+            // Increase total difficulty
+            td += header.difficulty();
+
             // Append to Headers segment
-            writer.append_header(header, header_hash)?;
+            writer.append_header(header, td, header_hash)?;
         }
 
         info!(target: "sync::stages::headers", total = total_headers, "Writing headers hash index");
@@ -164,7 +175,7 @@ where
             let (hash, number) = hash_to_number?;
 
             if index > 0 && index.is_multiple_of(interval) && total_headers > 100 {
-                info!(target: "sync::stages::headers", progress = %format_args!("{:.2}%", (index as f64 / total_headers as f64) * 100.0), "Writing headers hash index");
+                info!(target: "sync::stages::headers", progress = %format!("{:.2}%", (index as f64 / total_headers as f64) * 100.0), "Writing headers hash index");
             }
 
             if first_sync {
@@ -335,6 +346,9 @@ where
                 (input.unwind_to + 1)..,
             )?;
         provider.tx_ref().unwind_table_by_num::<tables::CanonicalHeaders>(input.unwind_to)?;
+        provider
+            .tx_ref()
+            .unwind_table_by_num::<tables::HeaderTerminalDifficulties>(input.unwind_to)?;
         let unfinalized_headers_unwound = provider.tx_ref().unwind_table_by_num::<tables::Headers<
             HeaderTy<Provider::Primitives>,
         >>(input.unwind_to)?;
@@ -392,9 +406,13 @@ mod tests {
     };
     use alloy_primitives::B256;
     use assert_matches::assert_matches;
-    use reth_provider::{DatabaseProviderFactory, ProviderFactory, StaticFileProviderFactory};
+    use reth_ethereum_primitives::BlockBody;
+    use reth_execution_types::ExecutionOutcome;
+    use reth_primitives_traits::{RecoveredBlock, SealedBlock};
+    use reth_provider::{BlockWriter, ProviderFactory, StaticFileProviderFactory};
     use reth_stages_api::StageUnitCheckpoint;
     use reth_testing_utils::generators::{self, random_header, random_header_range};
+    use reth_trie::HashedPostStateSorted;
     use std::sync::Arc;
     use test_runner::HeadersTestRunner;
 
@@ -460,7 +478,7 @@ mod tests {
                 let start = input.checkpoint().block_number;
                 let headers = random_header_range(&mut rng, 0..start + 1, B256::ZERO);
                 let head = headers.last().cloned().unwrap();
-                self.db.insert_headers(headers.iter())?;
+                self.db.insert_headers_with_td(headers.iter())?;
 
                 // use previous checkpoint as seed size
                 let end = input.target.unwrap_or_default() + 1;
@@ -484,6 +502,9 @@ mod tests {
                 match output {
                     Some(output) if output.checkpoint.block_number > initial_checkpoint => {
                         let provider = self.db.factory.provider()?;
+                        let mut td = provider
+                            .header_td_by_number(initial_checkpoint.saturating_sub(1))?
+                            .unwrap_or_default();
 
                         for block_num in initial_checkpoint..output.checkpoint.block_number {
                             // look up the header hash
@@ -497,6 +518,10 @@ mod tests {
                             assert!(header.is_some());
                             let header = SealedHeader::seal_slow(header.unwrap());
                             assert_eq!(header.hash(), hash);
+
+                            // validate the header total difficulty
+                            td += header.difficulty;
+                            assert_eq!(provider.header_td_by_number(block_num)?, Some(td));
                         }
                     }
                     _ => self.check_no_header_entry_above(initial_checkpoint)?,
@@ -551,6 +576,10 @@ mod tests {
                     .ensure_no_entry_above_by_value::<tables::HeaderNumbers, _>(block, |val| val)?;
                 self.db.ensure_no_entry_above::<tables::CanonicalHeaders, _>(block, |key| key)?;
                 self.db.ensure_no_entry_above::<tables::Headers, _>(block, |key| key)?;
+                self.db.ensure_no_entry_above::<tables::HeaderTerminalDifficulties, _>(
+                    block,
+                    |num| num,
+                )?;
                 Ok(())
             }
 
@@ -611,14 +640,26 @@ mod tests {
             tip.hash(),
         );
 
-        let provider = runner.db().factory.database_provider_rw().unwrap();
-        let static_file_provider = provider.static_file_provider();
-        let mut writer = static_file_provider.latest_writer(StaticFileSegment::Headers).unwrap();
-        for header in sealed_headers {
-            writer.append_header(header.header(), &header.hash()).unwrap();
-        }
-        drop(writer);
+        // make them sealed blocks with senders by converting them to empty blocks
+        let sealed_blocks = sealed_headers
+            .iter()
+            .map(|header| {
+                RecoveredBlock::new_sealed(
+                    SealedBlock::from_sealed_parts(header.clone(), BlockBody::default()),
+                    vec![],
+                )
+            })
+            .collect();
 
+        // append the blocks
+        let provider = runner.db().factory.provider_rw().unwrap();
+        provider
+            .append_blocks_with_state(
+                sealed_blocks,
+                &ExecutionOutcome::default(),
+                HashedPostStateSorted::default(),
+            )
+            .unwrap();
         provider.commit().unwrap();
 
         // now we can unwind 10 blocks

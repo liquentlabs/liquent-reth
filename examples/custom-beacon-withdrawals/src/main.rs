@@ -162,6 +162,25 @@ impl ConfigureEvm for CustomEvmConfig {
     ) -> Result<EthBlockExecutionCtx<'_>, Self::Error> {
         self.inner.context_for_next_block(parent, attributes)
     }
+
+    fn parallel_executor<'a, DB: reth_ethereum::evm::primitives::ParallelDatabase + 'a>(
+        &self,
+        db: DB,
+    ) -> Box<
+        dyn reth_ethereum::evm::primitives::parallel_execute::ParallelExecutor<
+                Primitives = Self::Primitives,
+                Error = BlockExecutionError,
+            > + 'a,
+    > {
+        // NOTE(liquent): custom executor logic cannot run on levm; fall back to the serial
+        // wrapper, mirroring the `disable-levm` path.
+        Box::new(reth_ethereum::evm::primitives::parallel_execute::WrapExecutor::new(
+            reth_ethereum::evm::primitives::execute::BasicBlockExecutor::new(
+                self.clone(),
+                reth_ethereum::evm::revm::database_interface::WrapDatabaseRef(db),
+            ),
+        ))
+    }
 }
 
 impl ConfigureEngineEvm<ExecutionData> for CustomEvmConfig {
@@ -191,7 +210,7 @@ pub struct CustomBlockExecutor<'a, Evm> {
 
 impl<E> BlockExecutor for CustomBlockExecutor<'_, E>
 where
-    E: Evm<DB: StateDB, Spec: Into<SpecId> + Clone, Tx = TxEnv>,
+    E: Evm<DB: StateDB, Tx = TxEnv>,
 {
     type Transaction = TransactionSigned;
     type Receipt = Receipt;

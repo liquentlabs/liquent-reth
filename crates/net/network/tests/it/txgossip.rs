@@ -1,27 +1,30 @@
 //! Testing gossiping of transactions.
 use alloy_consensus::TxLegacy;
 use alloy_primitives::{Signature, U256};
+use futures::StreamExt;
 use reth_ethereum_primitives::TransactionSigned;
 use reth_network::{
     test_utils::{NetworkEventStream, Testnet},
     transactions::config::{
         TransactionIngressPolicy, TransactionPropagationKind, TransactionsManagerConfig,
     },
-    NetworkEventListenerProvider, Peers,
+    NetworkEvent, NetworkEventListenerProvider, Peers,
 };
-use reth_network_api::{PeerKind, PeersInfo};
-use reth_provider::test_utils::{ExtendedAccount, MockEthProvider};
+use reth_network_api::{events::PeerEvent, PeerKind, PeersInfo};
+use reth_provider::test_utils::ExtendedAccount;
 use reth_transaction_pool::{
     test_utils::TransactionGenerator, AddedTransactionOutcome, PoolTransaction, TransactionPool,
 };
 use std::sync::Arc;
 use tokio::join;
 
+use crate::provider_with_genesis_block;
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_tx_gossip() {
     reth_tracing::init_test_tracing();
 
-    let provider = MockEthProvider::default().with_genesis_block();
+    let provider = provider_with_genesis_block();
     let net = Testnet::create_with(2, provider.clone()).await;
 
     // install request handlers
@@ -42,7 +45,8 @@ async fn test_tx_gossip() {
 
     // ensure the sender has balance
     let sender = tx.sender();
-    provider.add_account(sender, ExtendedAccount::new(0, U256::from(100_000_000)));
+    // Balance must cover upfront cost: 50 Gwei (LIQUENT_MIN_BASE_FEE) * 300k gas = 1.5e16 wei.
+    provider.add_account(sender, ExtendedAccount::new(0, U256::from(10u128.pow(18))));
 
     // insert pending tx in peer0's pool
     let AddedTransactionOutcome { hash, .. } =
@@ -60,7 +64,7 @@ async fn test_tx_gossip() {
 async fn test_tx_propagation_policy_trusted_only() {
     reth_tracing::init_test_tracing();
 
-    let provider = MockEthProvider::default().with_genesis_block();
+    let provider = provider_with_genesis_block();
 
     let policy = TransactionPropagationKind::Trusted;
     let net = Testnet::create_with(2, provider.clone()).await;
@@ -82,7 +86,8 @@ async fn test_tx_propagation_policy_trusted_only() {
 
     // ensure the sender has balance
     let sender = tx.sender();
-    provider.add_account(sender, ExtendedAccount::new(0, U256::from(100_000_000)));
+    // Balance must cover upfront cost: 50 Gwei (LIQUENT_MIN_BASE_FEE) * 300k gas = 1.5e16 wei.
+    provider.add_account(sender, ExtendedAccount::new(0, U256::from(10u128.pow(18))));
 
     // insert the tx in peer0's pool
     let outcome_0 = peer_0_handle.pool().unwrap().add_external_transaction(tx).await.unwrap();
@@ -109,7 +114,8 @@ async fn test_tx_propagation_policy_trusted_only() {
 
     // ensure the sender has balance
     let sender = tx.sender();
-    provider.add_account(sender, ExtendedAccount::new(0, U256::from(100_000_000)));
+    // Balance must cover upfront cost: 50 Gwei (LIQUENT_MIN_BASE_FEE) * 300k gas = 1.5e16 wei.
+    provider.add_account(sender, ExtendedAccount::new(0, U256::from(10u128.pow(18))));
 
     // insert pending tx in peer0's pool
     let outcome_1 = peer_0_handle.pool().unwrap().add_external_transaction(tx).await.unwrap();
@@ -128,7 +134,7 @@ async fn test_tx_propagation_policy_trusted_only() {
 async fn test_tx_ingress_policy_trusted_only() {
     reth_tracing::init_test_tracing();
 
-    let provider = MockEthProvider::default().with_genesis_block();
+    let provider = provider_with_genesis_block();
 
     let tx_manager_config = TransactionsManagerConfig {
         ingress_policy: TransactionIngressPolicy::Trusted,
@@ -194,7 +200,7 @@ async fn test_tx_ingress_policy_trusted_only() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_4844_tx_gossip_penalization() {
     reth_tracing::init_test_tracing();
-    let provider = MockEthProvider::default().with_genesis_block();
+    let provider = provider_with_genesis_block();
     let net = Testnet::create_with(2, provider.clone()).await;
 
     // install request handlers
@@ -217,7 +223,8 @@ async fn test_4844_tx_gossip_penalization() {
 
     for tx in &txs {
         let sender = tx.sender();
-        provider.add_account(sender, ExtendedAccount::new(0, U256::from(100_000_000)));
+        // Balance must cover upfront cost: 50 Gwei (LIQUENT_MIN_BASE_FEE) * 300k gas = 1.5e16 wei.
+        provider.add_account(sender, ExtendedAccount::new(0, U256::from(10u128.pow(18))));
     }
 
     let signed_txs: Vec<Arc<TransactionSigned>> =
@@ -245,7 +252,7 @@ async fn test_4844_tx_gossip_penalization() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_sending_invalid_transactions() {
     reth_tracing::init_test_tracing();
-    let provider = MockEthProvider::default().with_genesis_block();
+    let provider = provider_with_genesis_block();
     let net = Testnet::create_with(2, provider.clone()).await;
     // install request handlers
     let net = net.with_eth_pool();
@@ -255,12 +262,11 @@ async fn test_sending_invalid_transactions() {
     let peer0 = &handle.peers()[0];
     let peer1 = &handle.peers()[1];
 
-    let mut peer1_events = NetworkEventStream::new(peer1.network().event_listener());
-
     // connect all the peers
     handle.connect_peers().await;
 
     assert_eq!(peer0.network().num_connected_peers(), 1);
+    let mut peer1_events = peer1.network().event_listener();
     let mut tx_listener = peer1.pool().unwrap().new_transactions_listener();
 
     for idx in 0..10 {
@@ -278,16 +284,24 @@ async fn test_sending_invalid_transactions() {
         peer0.network().send_transactions(*peer1.peer_id(), vec![Arc::new(tx)]);
     }
 
-    // The listener also receives connection events, and PeerAdded can still be queued after
-    // connect_peers returns. Wait specifically for the disconnect after bad transaction spam.
-    let (peer_id, _) = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        peer1_events.next_session_closed(),
-    )
-    .await
-    .expect("peer did not disconnect after invalid transaction spam")
-    .expect("network event stream ended before disconnect");
-    assert_eq!(peer_id, *peer0.peer_id());
+    // await disconnect for bad tx spam
+    if let Some(ev) = peer1_events.next().await {
+        match ev {
+            NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, .. }) => {
+                assert_eq!(peer_id, *peer0.peer_id());
+            }
+            NetworkEvent::ActivePeerSession { .. } |
+            NetworkEvent::Peer(PeerEvent::SessionEstablished { .. }) => {
+                panic!("unexpected SessionEstablished event")
+            }
+            NetworkEvent::Peer(PeerEvent::PeerAdded(_)) => {
+                panic!("unexpected PeerAdded event")
+            }
+            NetworkEvent::Peer(PeerEvent::PeerRemoved(_)) => {
+                panic!("unexpected PeerRemoved event")
+            }
+        }
+    }
 
     // ensure txs never made it to the pool
     assert!(tx_listener.try_recv().is_err());

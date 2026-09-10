@@ -29,7 +29,7 @@ use reth_rpc_server_types::constants::gas_oracle::{CALL_STIPEND_GAS, ESTIMATE_GA
 use revm::{
     context::Block,
     context_interface::{result::ExecutionResult, Cfg, Transaction},
-    Database as _,
+    primitives::KECCAK_EMPTY,
 };
 use tracing::trace;
 
@@ -94,13 +94,15 @@ pub trait EstimateCall: Call {
         }
 
         // the gas limit of the corresponding block
-        let block_gas_limit = evm_env.block_env.gas_limit();
-        // If EIP-8037 is enabled, the transaction gas limit cap is not applicable
-        let max_gas_limit = if evm_env.cfg_env.is_amsterdam_eip8037_enabled() {
-            block_gas_limit
-        } else {
-            evm_env.cfg_env.tx_gas_limit_cap().min(block_gas_limit)
-        };
+        let max_gas_limit = evm_env
+            .cfg_env
+            .tx_gas_limit_cap
+            // If EIP-8037 is enabled, the transaction gas limit cap is not applicable
+            .filter(|_| !evm_env.cfg_env.is_amsterdam_eip8037_enabled())
+            .map_or_else(
+                || evm_env.block_env.gas_limit(),
+                |cap| cap.min(evm_env.block_env.gas_limit()),
+            );
 
         // Determine the highest possible gas limit, considering both the request's specified limit
         // and the block's limit.
@@ -116,16 +118,15 @@ pub trait EstimateCall: Call {
 
         let mut tx_env = self.create_txn_env(&evm_env, request, &mut db)?;
 
-        // Check whether this is a basic transfer: empty input to an account without bytecode.
+        // Check if this is a basic transfer (no input data to account with no code)
         let is_basic_transfer = if tx_env.input().is_empty() &&
             let TxKind::Call(to) = tx_env.kind()
         {
-            // Fetch the account through `Database::basic` so the state overrides applied above
-            // are visible.
-            match db.basic(to) {
-                Ok(Some(account)) => account.is_empty_code_hash(),
-                Ok(None) => true,
-                Err(_) => false,
+            match db.database.basic_account(&to) {
+                Ok(Some(account)) => {
+                    account.bytecode_hash.is_none() || account.bytecode_hash == Some(KECCAK_EMPTY)
+                }
+                _ => true,
             }
         } else {
             false
@@ -143,14 +144,26 @@ pub trait EstimateCall: Call {
         // If the provided gas limit is less than computed cap, use that
         tx_env.set_gas_limit(tx_env.gas_limit().min(highest_gas_limit));
 
+        let block_number = evm_env.block_env.number();
+        let block_timestamp = evm_env.block_env.timestamp();
+        let current_randomness = evm_env.block_env.prevrandao();
+
         // Create EVM instance once and reuse it throughout the entire estimation process
         let mut evm = self.evm_config().evm_with_env(&mut db, evm_env);
+        self.register_custom_precompiles(
+            &mut evm,
+            block_number,
+            block_timestamp,
+            current_randomness,
+        );
 
-        // For basic transfers, try 21_000 gas before running the full binary search.
+        // For basic transfers, try using minimum gas before running full binary search
         if is_basic_transfer {
-            // A basic transfer executes no bytecode and receives no refunds, so the amount
-            // consumed by a successful run is the exact gas required. EIP-2780 can make that less
-            // than 21_000.
+            // If the tx is a simple transfer (call to an account with no code) we can
+            // shortcircuit. But simply returning
+            // `MIN_TRANSACTION_GAS` is dangerous because there might be additional
+            // field combos that bump the price up, so we try executing the function
+            // with the minimum gas limit to make sure.
             let mut min_tx_env = tx_env.clone();
             min_tx_env.set_gas_limit(MIN_TRANSACTION_GAS);
 
@@ -158,7 +171,7 @@ pub trait EstimateCall: Call {
             if let Ok(res) = evm.transact(min_tx_env).map_err(Self::Error::from_evm_err) &&
                 res.result.is_success()
             {
-                return Ok(U256::from(res.result.tx_gas_used()))
+                return Ok(U256::from(MIN_TRANSACTION_GAS))
             }
         }
 

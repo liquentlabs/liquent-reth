@@ -1,9 +1,8 @@
+use crate::providers::{StaticFileProvider, StaticFileProviderRWRefMut};
 use alloy_primitives::BlockNumber;
 use reth_errors::ProviderResult;
 use reth_static_file_types::StaticFileSegment;
 use reth_storage_api::NodePrimitivesProvider;
-
-use crate::providers::{StaticFileProvider, StaticFileProviderRWRefMut};
 
 /// Static file provider factory.
 pub trait StaticFileProviderFactory: NodePrimitivesProvider {

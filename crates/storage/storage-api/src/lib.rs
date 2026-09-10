@@ -6,16 +6,13 @@
     issue_tracker_base_url = "https://github.com/paradigmxyz/reth/issues/"
 )]
 #![cfg_attr(not(test), warn(unused_crate_dependencies))]
-#![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
 
 // Re-export used error types.
 pub use reth_storage_errors as errors;
-mod bal;
-pub use bal::*;
-
 mod account;
 pub use account::*;
 
@@ -89,8 +86,11 @@ mod block_indices;
 pub use block_indices::*;
 
 #[cfg(feature = "std")]
-mod block_writer;
+mod cache;
 #[cfg(feature = "std")]
+pub use cache::*;
+
+mod block_writer;
 pub use block_writer::*;
 
 mod state_writer;
@@ -100,15 +100,9 @@ mod header_sync_gap;
 pub use header_sync_gap::HeaderSyncGapProvider;
 
 #[cfg(feature = "db-api")]
-pub mod metadata;
-#[cfg(all(feature = "db-api", feature = "std"))]
-pub use metadata::StoragePath;
+mod metadata;
 #[cfg(feature = "db-api")]
-pub use metadata::{MetadataProvider, MetadataWriter, StorageSettingsCache};
-#[cfg(feature = "db-api")]
-pub use reth_db_api::models::{SnapAttempt, SnapAttemptId, StorageSettings, SNAP_ATTEMPT_VERSION};
+pub use metadata::{keys as metadata_keys, MetadataProvider, MetadataWriter, StorageSettingsCache};
 
 mod full;
 pub use full::*;
-
-pub mod macros;

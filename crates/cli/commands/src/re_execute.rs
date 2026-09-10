@@ -5,7 +5,6 @@ use crate::common::{
     EnvironmentArgs,
 };
 use alloy_consensus::{transaction::TxHashRef, BlockHeader, TxReceipt};
-use alloy_eip7928::bal::Bal;
 use alloy_primitives::{Address, B256, U256};
 use clap::Parser;
 use eyre::WrapErr;
@@ -14,11 +13,10 @@ use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_util::cancellation::CancellationToken;
 use reth_consensus::FullConsensus;
 use reth_evm::{execute::Executor, ConfigureEvm};
-use reth_node_core::args::JitArgs;
 use reth_primitives_traits::{format_gas_throughput, Account, BlockBody, GotExpected};
 use reth_provider::{
-    providers::BlockchainProvider, BlockHashReader, BlockNumReader, BlockReader, ChainSpecProvider,
-    DatabaseProviderFactory, ReceiptProvider, StaticFileProviderFactory, TransactionVariant,
+    BlockNumReader, BlockReader, ChainSpecProvider, DatabaseProviderFactory, ReceiptProvider,
+    StaticFileProviderFactory, TransactionVariant,
 };
 use reth_revm::{
     database::StateProviderDatabase,
@@ -67,9 +65,6 @@ pub struct Command<C: ChainSpecParser> {
     /// Continues with execution when an invalid block is encountered and collects these blocks.
     #[arg(long)]
     skip_invalid_blocks: bool,
-
-    #[command(flatten)]
-    pub jit: JitArgs,
 }
 
 impl<C: ChainSpecParser> Command<C> {
@@ -90,8 +85,8 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
         N: CliNodeTypes<ChainSpec = C::ChainSpec>,
     {
         // Default to 4GB RocksDB block cache for re-execute unless explicitly set.
-        if self.env.db.rocksdb_block_cache_size.is_none() {
-            self.env.db.rocksdb_block_cache_size = Some(4 << 30);
+        if self.env.db.block_cache_size.is_none() {
+            self.env.db.block_cache_size = Some(4 << 30);
         }
 
         let Environment { provider_factory, .. } = self.env.init::<N>(AccessRights::RO, runtime)?;
@@ -147,23 +142,14 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
             let cancellation = cancellation.clone();
             let next_block = Arc::clone(&next_block);
             tasks.spawn_blocking(move || {
-                let evm_config = evm_config.with_jit_support();
                 let executor_lifetime = Duration::from_secs(600);
                 let provider = provider_factory.database_provider_ro()?.disable_long_read_transaction_safety();
-                let state_provider_factory = BlockchainProvider::new(provider_factory.clone())?;
-                // Reused across blocks for BAL hash encoding.
-                let mut bal_buf = Vec::new();
 
                 let db_at = {
-                    |block_number: u64| {
-                        let provider = provider_factory
-                            .database_provider_ro()
-                            .unwrap()
-                            .disable_long_read_transaction_safety();
-                        let hash = provider.block_hash(block_number).unwrap().unwrap();
+                    let provider_factory = provider_factory.clone();
+                    move |block_number: u64| {
                         StateProviderDatabase(
-                            state_provider_factory
-                                .state_provider_from_database(provider, hash),
+                            provider_factory.history_by_block_number(block_number).unwrap(),
                         )
                     }
                 };
@@ -207,12 +193,8 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
                             }
                         };
 
-                        let bal_hash = executor
-                            .take_bal()
-                            .map(|bal| Bal::from(bal).compute_hash_with_buf(&mut bal_buf));
-
                         if let Err(err) = consensus
-                            .validate_block_post_execution(&block, &result, None, bal_hash)
+                            .validate_block_post_execution(&block, &result, None,None)
                             .wrap_err_with(|| {
                                 format!(
                                     "Failed to validate block {} {}",
@@ -272,12 +254,6 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
                                 }
                             }
 
-                            if skip_invalid_blocks {
-                                executor =
-                                    evm_config.batch_executor(db_at(block.number()));
-                                let _ = info_tx.send((block, err));
-                                continue 'blocks;
-                            }
                             return Err(err);
                         }
                         let _ = stats_tx.send((block.number(), block.gas_used()));

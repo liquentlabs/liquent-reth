@@ -7,9 +7,10 @@
 //! 3. Get contract bytecode
 //! 4. Iterate through all storage slots for the contract
 
-use alloy_primitives::{map::B256Map, Address, U256};
+use alloy_primitives::map::B256Map;
 use reth_ethereum::{
     chainspec::ChainSpecBuilder,
+    evm::revm::primitives::{Address, U256},
     node::EthereumNode,
     primitives::{Account, Bytecode},
     provider::{
@@ -71,12 +72,8 @@ fn main() -> eyre::Result<()> {
 
     let datadir = std::env::var("RETH_DATADIR")?;
     let spec = ChainSpecBuilder::mainnet().build();
-    let runtime = reth_ethereum::tasks::Runtime::test();
-    let factory = EthereumNode::provider_factory_builder().open_read_only(
-        spec.into(),
-        ReadOnlyConfig::from_datadir(datadir),
-        runtime,
-    )?;
+    let factory = EthereumNode::provider_factory_builder()
+        .open_read_only(spec.into(), ReadOnlyConfig::from_datadir(datadir))?;
 
     let provider = factory.provider()?;
     let state_provider = factory.latest()?;

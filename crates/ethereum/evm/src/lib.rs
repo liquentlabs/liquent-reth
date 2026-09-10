@@ -17,37 +17,45 @@
 
 extern crate alloc;
 
-use alloc::{borrow::Cow, sync::Arc};
+use crate::parallel_execute::LevmExecutor;
+use alloc::{borrow::Cow, boxed::Box, sync::Arc, vec::Vec};
 use alloy_consensus::Header;
 use alloy_evm::{
     eth::{EthBlockExecutionCtx, EthBlockExecutorFactory},
-    EthEvmFactory, FromRecoveredTx, FromTxWithEncoded,
+    precompiles::DynPrecompile,
+    Database, EthEvmFactory, Evm,
 };
-#[cfg(feature = "jit")]
-use core::any::Any;
+use alloy_primitives::{Address, Bytes, U256};
+use alloy_rpc_types_engine::ExecutionData;
 use core::{convert::Infallible, fmt::Debug};
-use reth_chainspec::{ChainSpec, EthChainSpec, MAINNET};
-use reth_ethereum_primitives::{Block, EthPrimitives, TransactionSigned};
+use liquent_primitives::get_liquent_config;
+use levm::{DelegatedSafetyConfig, LevmConfig};
+use reth_chainspec::{ChainSpec, EthChainSpec, EthereumHardforks, MAINNET};
+use reth_ethereum_primitives::{Block, EthPrimitives};
 use reth_evm::{
-    eth::NextEvmEnvAttributes, precompiles::PrecompilesMap, ConfigureEvm, EvmEnv, EvmFactory,
-    JitBackend, NextBlockEnvAttributes, SenderRecoveryCache, TransactionEnvMut,
+    eth::NextEvmEnvAttributes, execute::BlockExecutionError, parallel_execute::ParallelExecutor,
+    ConfigureEvm, EvmEnv, NextBlockEnvAttributes, ParallelDatabase,
 };
-use reth_primitives_traits::{SealedBlock, SealedHeader};
-use revm::{context::BlockEnv, primitives::hardfork::SpecId};
+use reth_primitives_traits::{constants::LIQUENT_TX_GAS_LIMIT_CAP, SealedBlock, SealedHeader};
+use revm::{
+    context::{
+        result::{ExecutionResult, HaltReason},
+        BlockEnv, CfgEnv, TxEnv,
+    },
+    context_interface::block::BlobExcessGasAndPrice,
+    database::State,
+    primitives::hardfork::SpecId,
+    DatabaseCommit,
+};
 
 #[cfg(feature = "std")]
 use reth_evm::{ConfigureEngineEvm, ExecutableTxIterator};
-#[allow(unused_imports)]
+#[cfg(feature = "std")]
 use {
     alloy_eips::Decodable2718,
-    alloy_primitives::{Bytes, U256},
-    alloy_rpc_types_engine::ExecutionData,
-    reth_chainspec::EthereumHardforks,
     reth_evm::{EvmEnvFor, ExecutionCtxFor},
-    reth_primitives_traits::{constants::MAX_TX_GAS_LIMIT_OSAKA, SignedTransaction, TxTy},
+    reth_primitives_traits::{SignedTransaction, TxTy},
     reth_storage_errors::any::AnyError,
-    revm::context::CfgEnv,
-    revm::context_interface::block::BlobExcessGasAndPrice,
 };
 
 pub use alloy_evm::EthEvm;
@@ -67,6 +75,29 @@ pub mod execute {
     pub type EthExecutorProvider = EthEvmConfig;
 }
 
+pub mod hardfork;
+pub mod parallel_execute;
+pub mod skipped_transaction;
+
+// ============================================================================
+// Liquent system-tx gas-exempt gating
+// ============================================================================
+//
+// Both the canonical execution layer (this crate's serial `transact_system_txn`
+// + levm `parallel_execute.rs::transact_system_txn`) and every RPC replay path
+// that re-executes a persisted system tx (sender == `SYSTEM_CALLER`) MUST gate
+// the cfg-side fee/balance disables on the SAME predicate, queried against the
+// timestamp of the block being executed/replayed. Any drift between callsites
+// forks state root on system-tx blocks.
+//
+// The predicate itself (`is_system_tx_gas_exempt`) is defined in `reth-chainspec`
+// alongside `SYSTEM_CALLER`/`is_liquent_system_caller`, so every callsite (this
+// crate's serial + levm twins, the pipe layer's system-tx construction, and all
+// RPC replay paths in `reth-rpc-eth-api` / `reth-rpc`) reuses a single function
+// without crate-edge gymnastics.
+
+pub use reth_chainspec::{is_liquent_system_caller, is_system_tx_gas_exempt, SYSTEM_CALLER};
+
 mod build;
 pub use build::EthBlockAssembler;
 
@@ -78,8 +109,6 @@ mod test_utils;
 #[cfg(feature = "test-utils")]
 pub use test_utils::*;
 
-pub mod factory;
-
 /// Ethereum-related EVM configuration.
 #[derive(Debug, Clone)]
 pub struct EthEvmConfig<C = ChainSpec, EvmFactory = EthEvmFactory> {
@@ -87,8 +116,6 @@ pub struct EthEvmConfig<C = ChainSpec, EvmFactory = EthEvmFactory> {
     pub executor_factory: EthBlockExecutorFactory<RethReceiptBuilder, Arc<C>, EvmFactory>,
     /// Ethereum block assembler.
     pub block_assembler: EthBlockAssembler<C>,
-    /// Cache of recovered transaction senders, if enabled.
-    pub sender_recovery_cache: Option<SenderRecoveryCache>,
 }
 
 impl EthEvmConfig {
@@ -115,7 +142,6 @@ impl<ChainSpec, EvmFactory> EthEvmConfig<ChainSpec, EvmFactory> {
     pub fn new_with_evm_factory(chain_spec: Arc<ChainSpec>, evm_factory: EvmFactory) -> Self {
         Self {
             block_assembler: EthBlockAssembler::new(chain_spec.clone()),
-            sender_recovery_cache: None,
             executor_factory: EthBlockExecutorFactory::new(
                 RethReceiptBuilder::default(),
                 chain_spec,
@@ -128,35 +154,57 @@ impl<ChainSpec, EvmFactory> EthEvmConfig<ChainSpec, EvmFactory> {
     pub const fn chain_spec(&self) -> &Arc<ChainSpec> {
         self.executor_factory.spec()
     }
+}
 
-    /// Uses the provided sender recovery cache.
-    pub fn with_sender_recovery_cache(mut self, cache: SenderRecoveryCache) -> Self {
-        self.sender_recovery_cache = Some(cache);
-        self
+/// Pin the per-tx gas cap to Liquent's Monad-style value once `Osaka` is active.
+///
+/// alloy-evm's `for_eth_block` / `for_eth_next_block` and `evm_env_for_payload` set
+/// `tx_gas_limit_cap = Some(MAX_TX_GAS_LIMIT_OSAKA)` (EIP-7825, `2^24`) under OSAKA. Liquent
+/// overrides that with [`LIQUENT_TX_GAS_LIMIT_CAP`] (30M) so the 30M system transactions clear
+/// the cap. Must stay in lockstep with the consensus-side check (`reth-consensus-common`) and
+/// the pipe `tx_filter` guard.
+const fn apply_liquent_tx_gas_cap(cfg_env: &mut CfgEnv, osaka_active: bool) {
+    if osaka_active {
+        cfg_env.tx_gas_limit_cap = Some(LIQUENT_TX_GAS_LIMIT_CAP);
     }
 }
 
-impl<ChainSpec, EvmF> ConfigureEvm for EthEvmConfig<ChainSpec, EvmF>
+impl<ChainSpec> EthEvmConfig<ChainSpec>
 where
     ChainSpec: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static,
-    EvmF: EvmFactory<
-            Tx: TransactionEnvMut
-                    + FromRecoveredTx<TransactionSigned>
-                    + FromTxWithEncoded<TransactionSigned>,
-            Spec = SpecId,
-            BlockEnv = BlockEnv,
-            Precompiles = PrecompilesMap,
-        > + Clone
-        + Debug
-        + Send
-        + Sync
-        + Unpin
-        + 'static,
+{
+    /// Creates a levm executor with the delegated-account policy required by the caller.
+    ///
+    /// The regular history-sync path passes [`DelegatedSafetyConfig::disabled`]. Liquent's live
+    /// pipeline passes [`DelegatedSafetyConfig::enabled`]; levm makes that policy inert for
+    /// pre-Prague specs on a per-block basis.
+    pub fn parallel_executor_with_delegated_safety<'a, DB: ParallelDatabase + 'a>(
+        &self,
+        db: DB,
+        delegated_safety: DelegatedSafetyConfig,
+    ) -> Box<dyn ParallelExecutor<Primitives = EthPrimitives, Error = BlockExecutionError> + 'a>
+    {
+        let mut config = LevmConfig::from_env().with_delegated_safety(delegated_safety);
+        if get_liquent_config().disable_levm {
+            config.force_sequential = true;
+        }
+        Box::new(LevmExecutor::new_with_runtime_config(
+            self.chain_spec().clone(),
+            self,
+            db,
+            config,
+        ))
+    }
+}
+
+impl<ChainSpec> ConfigureEvm for EthEvmConfig<ChainSpec>
+where
+    ChainSpec: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static,
 {
     type Primitives = EthPrimitives;
     type Error = Infallible;
     type NextBlockEnvCtx = NextBlockEnvAttributes;
-    type BlockExecutorFactory = EthBlockExecutorFactory<RethReceiptBuilder, Arc<ChainSpec>, EvmF>;
+    type BlockExecutorFactory = EthBlockExecutorFactory<RethReceiptBuilder, Arc<ChainSpec>>;
     type BlockAssembler = EthBlockAssembler<ChainSpec>;
 
     fn block_executor_factory(&self) -> &Self::BlockExecutorFactory {
@@ -167,52 +215,18 @@ where
         &self.block_assembler
     }
 
-    fn with_jit_support_enabled(self, enabled: bool) -> Self
-    where
-        Self: Sized,
-    {
-        #[cfg(feature = "jit")]
-        {
-            let mut this = self;
-            let mut evm_factory = this.executor_factory.evm_factory().clone();
-            if let Some(factory) =
-                (&mut evm_factory as &mut dyn Any).downcast_mut::<factory::RethEvmFactory>()
-            {
-                factory.set_jit_support(enabled);
-            }
-            this.executor_factory = EthBlockExecutorFactory::new(
-                *this.executor_factory.receipt_builder(),
-                this.executor_factory.spec().clone(),
-                evm_factory,
-            );
-            this
-        }
-
-        #[cfg(not(feature = "jit"))]
-        {
-            let _ = enabled;
-            self
-        }
-    }
-
-    fn jit_backend(&self) -> Option<&dyn JitBackend> {
-        #[cfg(feature = "jit")]
-        if let Some(factory) = (self.executor_factory.evm_factory() as &dyn Any)
-            .downcast_ref::<factory::RethEvmFactory>()
-        {
-            return Some(factory);
-        }
-
-        None
-    }
-
     fn evm_env(&self, header: &Header) -> Result<EvmEnv<SpecId>, Self::Error> {
-        Ok(EvmEnv::for_eth_block(
+        let mut evm_env = EvmEnv::for_eth_block(
             header,
             self.chain_spec(),
             self.chain_spec().chain().id(),
             self.chain_spec().blob_params_at_timestamp(header.timestamp),
-        ))
+        );
+        apply_liquent_tx_gas_cap(
+            &mut evm_env.cfg_env,
+            self.chain_spec().is_osaka_active_at_timestamp(header.timestamp),
+        );
+        Ok(evm_env)
     }
 
     fn next_evm_env(
@@ -220,7 +234,7 @@ where
         parent: &Header,
         attributes: &NextBlockEnvAttributes,
     ) -> Result<EvmEnv, Self::Error> {
-        Ok(EvmEnv::for_eth_next_block(
+        let mut evm_env = EvmEnv::for_eth_next_block(
             parent,
             NextEvmEnvAttributes {
                 timestamp: attributes.timestamp,
@@ -233,7 +247,12 @@ where
             self.chain_spec(),
             self.chain_spec().chain().id(),
             self.chain_spec().blob_params_at_timestamp(attributes.timestamp),
-        ))
+        );
+        apply_liquent_tx_gas_cap(
+            &mut evm_env.cfg_env,
+            self.chain_spec().is_osaka_active_at_timestamp(attributes.timestamp),
+        );
+        Ok(evm_env)
     }
 
     fn context_for_block<'a>(
@@ -266,25 +285,63 @@ where
             slot_number: attributes.slot_number,
         })
     }
+
+    fn parallel_executor<'a, DB: ParallelDatabase + 'a>(
+        &self,
+        db: DB,
+    ) -> Box<dyn ParallelExecutor<Primitives = Self::Primitives, Error = BlockExecutionError> + 'a>
+    {
+        self.parallel_executor_with_delegated_safety(db, DelegatedSafetyConfig::disabled())
+    }
+
+    fn transact_system_txn<DB: Database>(
+        &self,
+        db: &mut State<DB>,
+        mut evm_env: EvmEnv,
+        precompiles: Vec<(Address, DynPrecompile)>,
+        tx_env: TxEnv,
+    ) -> Result<ExecutionResult<HaltReason>, BlockExecutionError> {
+        // revm v40+ removed `set_state_clear_flag`: the database layer always applies
+        // post-EIP-161 commit semantics, and levm's `ParallelState::set_state_clear_flag`
+        // is now a no-op stub. The PR #363 invariant (serial `disable-levm` ↔ parallel
+        // levm backend must agree on system-tx block state roots) is now upheld by
+        // default on both sides without a caller-side toggle.
+
+        // Liquent Alpha hardfork: gas-exempt the `SYSTEM_CALLER`-sourced system
+        // transactions on the L1 (cfg-side) lever. Combined with the L2
+        // (construction-side) `gas_price = 0` at the pipe layer, this drops the
+        // SYSTEM_CALLER fee bill to zero while preserving gas metering, calldata,
+        // state writes, receipts and `gas_used`.
+        //
+        // MUST stay byte-identical with the levm twin in
+        // `parallel_execute.rs::transact_system_txn`. Any drift forks state root.
+        let block_ts: u64 = evm_env.block_env.timestamp.saturating_to();
+        if is_system_tx_gas_exempt(self.chain_spec().as_ref(), block_ts) {
+            evm_env.cfg_env.disable_base_fee = true;
+            evm_env.cfg_env.disable_balance_check = true;
+            // `disable_nonce_check` deliberately left `false` — SYSTEM_CALLER's
+            // nonce sequence is part of the protocol contract.
+        }
+
+        let (execution_result, evm_state) = {
+            let mut evm = self.evm_with_env(&mut *db, evm_env);
+            for (addr, precompile) in precompiles {
+                Evm::precompiles_mut(&mut evm).apply_precompile(&addr, move |_| Some(precompile));
+            }
+            let result = Evm::transact_raw(&mut evm, tx_env).map_err(|e| {
+                BlockExecutionError::msg(alloc::format!("system txn execution failed: {e:?}"))
+            })?;
+            (result.result, result.state)
+        };
+        db.commit(evm_state);
+        Ok(execution_result)
+    }
 }
 
 #[cfg(feature = "std")]
-impl<ChainSpec, EvmF> ConfigureEngineEvm<ExecutionData> for EthEvmConfig<ChainSpec, EvmF>
+impl<ChainSpec> ConfigureEngineEvm<ExecutionData> for EthEvmConfig<ChainSpec>
 where
     ChainSpec: EthExecutorSpec + EthChainSpec<Header = Header> + Hardforks + 'static,
-    EvmF: EvmFactory<
-            Tx: TransactionEnvMut
-                    + FromRecoveredTx<TransactionSigned>
-                    + FromTxWithEncoded<TransactionSigned>,
-            Spec = SpecId,
-            BlockEnv = BlockEnv,
-            Precompiles = PrecompilesMap,
-        > + Clone
-        + Debug
-        + Send
-        + Sync
-        + Unpin
-        + 'static,
 {
     fn evm_env_for_payload(&self, payload: &ExecutionData) -> Result<EvmEnvFor<Self>, Self::Error> {
         let timestamp = payload.payload.timestamp();
@@ -303,9 +360,10 @@ where
             cfg_env.set_max_blobs_per_tx(blob_params.max_blobs_per_tx);
         }
 
-        if self.chain_spec().is_osaka_active_at_timestamp(timestamp) {
-            cfg_env.tx_gas_limit_cap = Some(MAX_TX_GAS_LIMIT_OSAKA);
-        }
+        apply_liquent_tx_gas_cap(
+            &mut cfg_env,
+            self.chain_spec().is_osaka_active_at_timestamp(timestamp),
+        );
 
         // derive the EIP-4844 blob fees from the header's `excess_blob_gas` and the current
         // blobparams
@@ -354,16 +412,10 @@ where
         payload: &ExecutionData,
     ) -> Result<impl ExecutableTxIterator<Self>, Self::Error> {
         let txs = payload.payload.transactions().clone();
-        let sender_recovery_cache = self.sender_recovery_cache.clone();
-        let convert = move |tx: Bytes| {
+        let convert = |tx: Bytes| {
             let tx =
                 TxTy::<Self::Primitives>::decode_2718_exact(tx.as_ref()).map_err(AnyError::new)?;
-            let signer = if let Some(cache) = &sender_recovery_cache {
-                cache.recover(&tx)
-            } else {
-                tx.try_recover()
-            }
-            .map_err(AnyError::new)?;
+            let signer = tx.try_recover().map_err(AnyError::new)?;
             Ok::<_, AnyError>(tx.with_signer(signer))
         };
 
@@ -551,34 +603,5 @@ mod tests {
         assert_eq!(evm.block, evm_env.block_env);
         assert_eq!(evm.cfg, evm_env.cfg_env);
         assert_eq!(evm.tx, Default::default());
-    }
-
-    #[cfg(feature = "jit")]
-    #[test]
-    fn test_jit_support_downcast_updates_reth_factory() {
-        let evm_config = EthEvmConfig::new_with_evm_factory(
-            MAINNET.clone(),
-            factory::RethEvmFactory::disabled(),
-        );
-
-        assert!(evm_config.jit_backend().is_some());
-        assert!(!evm_config.executor_factory.evm_factory().jit_support_enabled());
-
-        let evm_config = evm_config.with_jit_support();
-        assert!(evm_config.executor_factory.evm_factory().jit_support_enabled());
-
-        let evm_config = evm_config.with_jit_support_enabled(false);
-        assert!(!evm_config.executor_factory.evm_factory().jit_support_enabled());
-    }
-
-    #[cfg(feature = "jit")]
-    #[test]
-    fn test_jit_support_downcast_ignores_plain_factory() {
-        let evm_config = EthEvmConfig::mainnet();
-
-        assert!(evm_config.jit_backend().is_none());
-
-        let evm_config = evm_config.with_jit_support();
-        assert!(evm_config.jit_backend().is_none());
     }
 }

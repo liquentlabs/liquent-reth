@@ -11,6 +11,7 @@ use crate::{
 };
 use alloy_consensus::BlockHeader;
 use futures::{stream::FusedStream, stream_select, FutureExt, StreamExt};
+use liquent_primitives::get_liquent_config;
 use reth_chainspec::{EthChainSpec, EthereumHardforks};
 use reth_db::{database_metrics::DatabaseMetrics, Database};
 use reth_engine_tree::{
@@ -37,7 +38,6 @@ use reth_provider::{
     providers::{BlockchainProvider, NodeTypesForProvider},
     BlockNumReader, StorageSettingsCache,
 };
-use reth_storage_overlay::OverlayManager;
 use reth_tasks::TaskExecutor;
 use reth_tokio_util::EventSender;
 use reth_tracing::tracing::{debug, error, info};
@@ -85,17 +85,12 @@ impl EngineNodeLauncher {
         let Self { ctx, engine_tree_config } = self;
         let NodeBuilderWithComponents {
             adapter: NodeTypesAdapter { database },
-            rocksdb_provider,
             components_builder,
             add_ons: AddOns { hooks, exexs: installed_exex, add_ons },
             config,
         } = target;
         let NodeHooks { on_component_initialized, on_node_started, .. } = hooks;
 
-        // Create the overlay manager that will be shared across the provider and engine.
-        let overlay_manager = OverlayManager::<N::Primitives>::new(
-            ctx.task_executor.state_trie_overlay_worker_pool(),
-        );
         let disabled_stages = N::disabled_stages();
 
         // setup the launch context
@@ -109,13 +104,8 @@ impl EngineNodeLauncher {
             .attach(database.clone())
             // ensure certain settings take effect
             .with_adjusted_configs()
-            // Create the provider factory with the shared overlay manager
-            .with_provider_factory::<_, <CB::Components as NodeComponents<T>>::Evm>(
-                overlay_manager.clone(),
-                rocksdb_provider,
-                disabled_stages,
-            )
-            .await?
+            // Create the provider factory
+            .with_provider_factory::<_, <CB::Components as NodeComponents<T>>::Evm>().await?
             .inspect(|_| {
                 info!(target: "reth::cli", "Database opened");
             })
@@ -123,13 +113,31 @@ impl EngineNodeLauncher {
             .inspect(|this| {
                 debug!(target: "reth::cli", chain=%this.chain_id(), genesis=?this.genesis_hash(), "Initializing genesis");
             })
-            .with_genesis()?
+            .with_genesis()?;
+
+        eyre::ensure!(
+            !get_liquent_config().persist_merge_blocks ||
+                !ctx.provider_factory().cached_storage_settings().changesets_in_static_files,
+            "--liquent.persist.merge-blocks is incompatible with Storage V2"
+        );
+
+        let ctx = ctx
             .inspect(|this: &LaunchContextWith<Attached<WithConfigs<<T::Types as NodeTypes>::ChainSpec>, _>>| {
                 info!(target: "reth::cli", "\n{}", this.chain_spec().display_hardforks());
-                let settings = this.provider_factory().cached_storage_settings();
+                // Genesis init has run, so the cache holds the layout persisted in the datadir
+                // — for an existing datadir that is its stored layout, not what `--storage.v2`
+                // asked for. Reporting it unconditionally is the only way an operator can tell
+                // which layout is live: the flag is a plain bool with no "unspecified" state,
+                // so a stored-vs-requested mismatch can not distinguish "your flag was ignored"
+                // from "you booted a migrated datadir without repeating the flag".
+                let storage_layout = if this.provider_factory().cached_storage_settings().changesets_in_static_files {
+                    "static-files"
+                } else {
+                    "legacy"
+                };
                 let pruning_mode =
                     PruneConfigKind::from_config(&this.prune_config(), this.chain_spec().as_ref()).as_str();
-                info!(target: "reth::cli", ?settings, ?pruning_mode, "Loaded storage settings");
+                info!(target: "reth::cli", storage_layout, ?pruning_mode, "Loaded storage settings");
             })
             .with_metrics_task()
             // passing FullNodeTypes as type parameter here so that we can build
@@ -209,11 +217,10 @@ impl EngineNodeLauncher {
         // Build the engine validator with all required components
         let engine_validator = validator_builder
             .clone()
-            .build_tree_validator(&add_ons_ctx, engine_tree_config.clone(), overlay_manager.clone())
+            .build_tree_validator(&add_ons_ctx, engine_tree_config.clone())
             .await?;
 
         // Create the consensus engine stream with optional reorg
-        let reorg_overlay_manager = overlay_manager.clone();
         let consensus_engine_stream = UnboundedReceiverStream::from(consensus_engine_rx)
             .maybe_skip_fcu(node_config.debug.skip_fcu)
             .maybe_skip_new_payload(node_config.debug.skip_new_payload)
@@ -222,11 +229,7 @@ impl EngineNodeLauncher {
                 ctx.components().evm_config().clone(),
                 || async {
                     validator_builder
-                        .build_tree_validator(
-                            &add_ons_ctx,
-                            engine_tree_config.clone(),
-                            reorg_overlay_manager.clone(),
-                        )
+                        .build_tree_validator(&add_ons_ctx, engine_tree_config.clone())
                         .await
                 },
                 node_config.debug.reorg_frequency,
@@ -256,7 +259,6 @@ impl EngineNodeLauncher {
             pruner,
             ctx.components().payload_builder_handle().clone(),
             engine_validator,
-            overlay_manager,
             engine_tree_config,
             ctx.sync_metrics_tx(),
             ctx.components().evm_config().clone(),
@@ -276,11 +278,11 @@ impl EngineNodeLauncher {
 
         ctx.task_executor().spawn_critical_task(
             "events task",
-            node::handle_events(
+            Box::pin(node::handle_events(
                 Some(Box::new(ctx.components().network().clone())),
                 Some(ctx.head().number),
                 events,
-            ),
+            )),
         );
 
         let RpcHandle {
@@ -379,6 +381,22 @@ impl EngineNodeLauncher {
                     payload = built_payloads.select_next_some(), if !built_payloads.is_terminated() => {
                         if let Some(executed_block) = payload.executed_block() {
                             debug!(target: "reth::cli", block=?executed_block.recovered_block.num_hash(),  "inserting built payload");
+                            // Bridge the v2.3.0 `BuiltPayloadExecutedBlock` into the liquent-form
+                            // `ExecutedBlockWithTrieUpdates`. The payload builder computes only the
+                            // legacy trie updates; nested (V2) trie updates are left empty because
+                            // this local-payload path is not used by liquent consensus (pipe-exec
+                            // drives the canonical chain).
+                            let block_number = executed_block.recovered_block.number();
+                            let executed_block = reth_chain_state::ExecutedBlockWithTrieUpdates::new(
+                                executed_block.recovered_block,
+                                Arc::new(reth_provider::ExecutionOutcome::single(
+                                    block_number,
+                                    Arc::unwrap_or_clone(executed_block.execution_output),
+                                )),
+                                executed_block.hashed_state,
+                                reth_chain_state::ExecutedTrieUpdates::Present(executed_block.trie_updates),
+                                Default::default(),
+                            );
                             orchestrator.handler_mut().handler_mut().on_event(EngineApiRequest::InsertExecutedBlock(executed_block).into());
                         }
                     }

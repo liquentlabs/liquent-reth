@@ -25,7 +25,7 @@ pub(crate) struct PrunedIndices {
     pub(crate) unchanged: usize,
 }
 
-/// Result of pruning history changesets, used to build the final output.
+/// Result of pruning history changesets, used to build the final segment output.
 pub(crate) struct HistoryPruneResult<K> {
     /// Map of the highest deleted changeset keys to their block numbers.
     pub(crate) highest_deleted: FxHashMap<K, BlockNumber>,
@@ -42,7 +42,13 @@ pub(crate) struct HistoryPruneResult<K> {
 
 /// Finalizes history pruning by sorting sharded keys, pruning history indices, and building output.
 ///
-/// This is shared between static file and database pruning for both account and storage history.
+/// Shared between the static-file and database changeset paths for both account and storage
+/// history: the changeset source differs, but computing the checkpoint block, pruning the history
+/// index shards, and assembling [`SegmentOutput`] is identical.
+///
+/// Callers that can leave a block half-pruned (database table walks) must apply the block-level
+/// rewind themselves before calling this. Static-file walks delete nothing and must report the last
+/// fully walked block so the checkpoint does not stall.
 pub(crate) fn finalize_history_prune<Provider, T, K, SK>(
     provider: &Provider,
     result: HistoryPruneResult<K>,
@@ -59,12 +65,11 @@ where
 {
     let HistoryPruneResult { highest_deleted, last_pruned_block, pruned_count, done } = result;
 
-    // Nothing was pruned only when the range held no changesets at all, so the whole range is
-    // done.
+    // Nothing was pruned only when the range held no changesets at all, so the whole range is done.
     let last_changeset_pruned_block = last_pruned_block.unwrap_or(range_end);
 
     // Sort highest deleted block numbers and turn them into sharded keys.
-    // We use `sorted_unstable` because no equal keys exist in the map.
+    // `sorted_unstable` is fine because no equal keys exist in the map.
     let highest_sharded_keys =
         highest_deleted.into_iter().sorted_unstable().map(|(key, block_number)| {
             to_sharded_key(key, block_number.min(last_changeset_pruned_block))
@@ -156,7 +161,9 @@ where
     // If shard consists only of block numbers less than the target one, delete shard
     // completely.
     if key.as_ref().highest_block_number <= to_block {
-        cursor.delete_current()?;
+        // Use delete_by_key instead of delete_current to ensure we delete the correct key
+        // regardless of cursor position visibility issues with RocksDB WriteBatch.
+        cursor.delete_by_key(RawKey::new(key))?;
         Ok(PruneShardOutcome::Deleted)
     }
     // Shard contains block numbers that are higher than the target one, so we need to
@@ -181,26 +188,29 @@ where
                     .prev()?
                     .map(|(k, v)| Result::<_, DatabaseError>::Ok((k.key()?, v)))
                     .transpose()?;
+
+                // Restore cursor position back to current key after prev() moved it.
+                // This is important for RocksDB because the caller will call next()
+                // after this function returns, expecting the cursor to be at the
+                // current position.
+                cursor.seek(RawKey::new(key.clone()))?;
+
                 match prev_row {
                     // If current shard is the last shard for the sharded key that
                     // has previous shards, replace it with the previous shard.
                     Some((prev_key, prev_value)) if key_matches(&prev_key, &key) => {
-                        cursor.delete_current()?;
-                        // Upsert will replace the last shard for this sharded key with
-                        // the previous value.
+                        // Delete the previous shard by its key
+                        cursor.delete_by_key(RawKey::new(prev_key))?;
+                        // Upsert the current (last) shard key with the previous shard's value
+                        // This effectively "promotes" the previous shard to be the new last shard
                         cursor.upsert(RawKey::new(key), &prev_value)?;
                         Ok(PruneShardOutcome::Updated)
                     }
                     // If there's no previous shard for this sharded key,
                     // just delete last shard completely.
                     _ => {
-                        // If we successfully moved the cursor to a previous row,
-                        // jump to the original last shard.
-                        if prev_row.is_some() {
-                            cursor.next()?;
-                        }
-                        // Delete shard.
-                        cursor.delete_current()?;
+                        // Delete by explicit key to avoid cursor position issues
+                        cursor.delete_by_key(RawKey::new(key))?;
                         Ok(PruneShardOutcome::Deleted)
                     }
                 }
@@ -208,7 +218,7 @@ where
             // If current shard is not the last shard for this sharded key,
             // just delete it.
             else {
-                cursor.delete_current()?;
+                cursor.delete_by_key(RawKey::new(key))?;
                 Ok(PruneShardOutcome::Deleted)
             }
         } else {

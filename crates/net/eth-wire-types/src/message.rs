@@ -13,9 +13,9 @@ use super::{
     PooledTransactions, Receipts, Status, StatusEth69, Transactions,
 };
 use crate::{
-    status::StatusMessage, BlockRangeUpdate, BroadcastPoolTransactions, Cells,
-    EthNetworkPrimitives, EthVersion, GetCells, NetworkPrimitives, NewPooledTransactionHashes72,
-    RawCapabilityMessage, Receipts69, Receipts70, SharedTransactions,
+    status::StatusMessage, BlockRangeUpdate, Cells, EthNetworkPrimitives, EthVersion, GetCells,
+    NetworkPrimitives, NewPooledTransactionHashes72, RawCapabilityMessage, Receipts69, Receipts70,
+    SharedTransactions,
 };
 use alloc::{boxed::Box, string::String, sync::Arc};
 use alloy_primitives::{
@@ -570,14 +570,12 @@ impl<N: NetworkPrimitives> Encodable for EthMessage<N> {
 /// never receive a hash of an object (block, transaction) it has already seen.
 ///
 /// Note: This is only useful for outgoing messages.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EthBroadcastMessage<N: NetworkPrimitives = EthNetworkPrimitives> {
     /// Represents a new block broadcast message.
     NewBlock(Arc<N::NewBlockPayload>),
     /// Represents a transactions broadcast message.
     Transactions(SharedTransactions<N::BroadcastedTransaction>),
-    /// Represents cached outbound pool transactions broadcast message.
-    BroadcastPoolTransactions(BroadcastPoolTransactions),
 }
 
 // === impl EthBroadcastMessage ===
@@ -587,15 +585,8 @@ impl<N: NetworkPrimitives> EthBroadcastMessage<N> {
     pub const fn message_id(&self) -> EthMessageID {
         match self {
             Self::NewBlock(_) => EthMessageID::NewBlock,
-            Self::Transactions(_) | Self::BroadcastPoolTransactions(_) => {
-                EthMessageID::Transactions
-            }
+            Self::Transactions(_) => EthMessageID::Transactions,
         }
-    }
-
-    /// Encodes this broadcast to its id-prefixed `RLPx` message bytes.
-    pub fn encoded(self) -> alloy_primitives::bytes::Bytes {
-        alloy_rlp::encode(ProtocolBroadcastMessage::from(self)).into()
     }
 }
 
@@ -604,7 +595,6 @@ impl<N: NetworkPrimitives> Encodable for EthBroadcastMessage<N> {
         match self {
             Self::NewBlock(new_block) => new_block.encode(out),
             Self::Transactions(transactions) => transactions.encode(out),
-            Self::BroadcastPoolTransactions(transactions) => transactions.encode(out),
         }
     }
 
@@ -612,7 +602,6 @@ impl<N: NetworkPrimitives> Encodable for EthBroadcastMessage<N> {
         match self {
             Self::NewBlock(new_block) => new_block.length(),
             Self::Transactions(transactions) => transactions.length(),
-            Self::BroadcastPoolTransactions(transactions) => transactions.length(),
         }
     }
 }

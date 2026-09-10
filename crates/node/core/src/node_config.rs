@@ -2,8 +2,8 @@
 
 use crate::{
     args::{
-        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, JitArgs, NetworkArgs,
-        PayloadBuilderArgs, PruningArgs, RpcServerArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
+        DatabaseArgs, DatadirArgs, DebugArgs, DevArgs, EngineArgs, NetworkArgs, PayloadBuilderArgs,
+        PruningArgs, RpcServerArgs, StaticFilesArgs, StorageArgs, TxPoolArgs,
     },
     dirs::{ChainPath, DataDirPath},
     utils::get_single_header,
@@ -14,15 +14,14 @@ use alloy_primitives::{BlockNumber, B256, U256};
 use eyre::eyre;
 use reth_chainspec::{ChainSpec, EthChainSpec, MAINNET};
 use reth_config::config::PruneConfig;
+use reth_db::models::LiquentStorageSettings;
 use reth_engine_local::MiningMode;
-use reth_engine_primitives::TreeConfig;
 use reth_ethereum_forks::{EthereumHardforks, Head};
 use reth_network_p2p::headers::client::HeadersClient;
 use reth_primitives_traits::SealedHeader;
 use reth_stages_types::StageId;
 use reth_storage_api::{
     BlockHashReader, DatabaseProviderFactory, HeaderProvider, StageCheckpointReader,
-    StorageSettings,
 };
 use reth_storage_errors::provider::ProviderResult;
 use reth_transaction_pool::TransactionPool;
@@ -155,9 +154,6 @@ pub struct NodeConfig<ChainSpec> {
 
     /// All storage related arguments with --storage prefix
     pub storage: StorageArgs,
-
-    /// All JIT related arguments with --jit prefix
-    pub jit: JitArgs,
 }
 
 impl NodeConfig<ChainSpec> {
@@ -190,13 +186,7 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             era: EraArgs::default(),
             static_files: StaticFilesArgs::default(),
             storage: StorageArgs::default(),
-            jit: JitArgs::default(),
         }
-    }
-
-    /// Creates a [`TreeConfig`] from all node arguments that affect the engine tree.
-    pub fn tree_config(&self) -> TreeConfig {
-        self.engine.tree_config().with_skip_state_root(self.debug.skip_state_root)
     }
 
     /// Sets --dev mode for the node.
@@ -271,7 +261,6 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             era,
             static_files,
             storage,
-            jit,
             ..
         } = self;
         NodeConfig {
@@ -292,7 +281,6 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             era,
             static_files,
             storage,
-            jit,
         }
     }
 
@@ -383,17 +371,13 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
         self.pruning.prune_config(&self.chain)
     }
 
-    /// Returns the effective storage settings for this node.
+    /// Returns the storage layout a *fresh* datadir should be initialized with, as selected by
+    /// `--storage.v2`.
     ///
-    /// Determined by the `--storage.v2` flag (defaults to `true`).
-    /// Existing databases retain whatever settings are persisted in their
-    /// metadata (checked during genesis init).
-    pub const fn storage_settings(&self) -> StorageSettings {
-        if self.storage.v2 {
-            StorageSettings::v2()
-        } else {
-            StorageSettings::v1()
-        }
+    /// An already initialized datadir keeps the settings persisted in its metadata; this value
+    /// never overrides them (see `init_genesis_with_settings`).
+    pub const fn storage_settings(&self) -> LiquentStorageSettings {
+        LiquentStorageSettings { changesets_in_static_files: self.storage.v2 }
     }
 
     /// Returns the max block that the node should run to, looking it up from the network if
@@ -591,7 +575,6 @@ impl<ChainSpec> NodeConfig<ChainSpec> {
             era: self.era,
             static_files: self.static_files,
             storage: self.storage,
-            jit: self.jit,
         }
     }
 
@@ -634,7 +617,6 @@ impl<ChainSpec> Clone for NodeConfig<ChainSpec> {
             era: self.era.clone(),
             static_files: self.static_files,
             storage: self.storage,
-            jit: self.jit.clone(),
         }
     }
 }
@@ -644,11 +626,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tree_config_applies_debug_skip_state_root() {
-        let config = NodeConfig::default();
-        assert!(!config.tree_config().skip_state_root());
+    fn storage_settings_follow_the_v2_flag() {
+        let mut config = NodeConfig::test();
 
-        let config = config.with_debug(DebugArgs { skip_state_root: true, ..Default::default() });
-        assert!(config.tree_config().skip_state_root());
+        config.storage.v2 = false;
+        assert_eq!(config.storage_settings(), LiquentStorageSettings::legacy());
+
+        config.storage.v2 = true;
+        assert!(config.storage_settings().changesets_in_static_files);
     }
 }

@@ -4,7 +4,7 @@ use crate::{
     peers::{InboundConnectionError, PeersManager},
     protocol::IntoRlpxSubProtocol,
     session::{Direction, PendingSessionHandshakeError, SessionEvent, SessionId, SessionManager},
-    state::{NetworkState, SessionActivation, StateAction},
+    state::{NetworkState, StateAction},
 };
 use futures::Stream;
 use reth_eth_wire::{
@@ -133,17 +133,15 @@ impl<N: NetworkPrimitives> Swarm<N> {
                 direction,
                 timeout,
                 range_info,
-                supports_snap,
             } => {
-                self.state.on_session_activated(SessionActivation {
-                    peer: peer_id,
-                    capabilities: capabilities.clone(),
-                    status: status.clone(),
-                    request_tx: messages.clone(),
+                self.state.on_session_activated(
+                    peer_id,
+                    capabilities.clone(),
+                    status.clone(),
+                    messages.clone(),
                     timeout,
                     range_info,
-                    supports_snap,
-                });
+                );
                 Some(SwarmEvent::SessionEstablished {
                     peer_id,
                     remote_addr,

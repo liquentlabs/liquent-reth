@@ -9,28 +9,24 @@ pub use database::*;
 
 mod static_file;
 pub use static_file::{
-    StaticFileAccess, StaticFileJarProvider, StaticFileProvider, StaticFileProviderBuilder,
-    StaticFileProviderRW, StaticFileProviderRWRefMut, StaticFileWriteCtx, StaticFileWriter,
+    StaticFileAccess, StaticFileJarProvider, StaticFileProvider, StaticFileProviderRW,
+    StaticFileProviderRWRefMut, StaticFileWriter,
 };
 
 mod state;
 pub use state::{
-    historical::{compute_history_rank, history_info, needs_prev_shard_check, HistoryInfo},
+    historical::{HistoricalStateProvider, HistoricalStateProviderRef, LowestAvailableBlocks},
     latest::{LatestStateProvider, LatestStateProviderRef},
 };
 
+mod consistent_view;
+pub use consistent_view::{ConsistentDbView, ConsistentViewError};
+
 mod blockchain_provider;
-pub use blockchain_provider::{BlockchainProvider, SNAPSHOT_STATE_RETENTION};
+pub use blockchain_provider::BlockchainProvider;
 
 mod consistent;
 pub use consistent::ConsistentProvider;
-
-pub(crate) mod rocksdb;
-
-pub use rocksdb::{
-    PruneShardOutcome, PrunedIndices, RocksDBBatch, RocksDBBuilder, RocksDBIter, RocksDBProvider,
-    RocksDBRawIter, RocksDBStats, RocksDBTableStats, RocksReadSnapshot, RocksTx,
-};
 
 /// Helper trait to bound [`NodeTypes`] so that combined with database they satisfy
 /// [`ProviderNodeTypes`].

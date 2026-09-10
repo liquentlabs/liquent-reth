@@ -139,7 +139,7 @@ Networking:
           [default: 200]
 
       --trusted-peers <TRUSTED_PEERS>
-          Comma separated enode URLs or ENRs of trusted peers for P2P connections.
+          Comma separated enode URLs of trusted peers for P2P connections.
 
           --trusted-peers enode://abcd@192.168.0.1:30303
 
@@ -147,7 +147,7 @@ Networking:
           Connect to or accept from trusted peers only
 
       --bootnodes <BOOTNODES>
-          Comma separated enode URLs or ENRs for P2P discovery bootstrap.
+          Comma separated enode URLs for P2P discovery bootstrap.
 
           Will fall back to a network-specific default if not specified.
 
@@ -332,22 +332,6 @@ RPC:
       --http.disable-compression
           Disable compression for HTTP responses
 
-      --http.compression <ALGOS>
-          Comma-separated list of allowed compression algorithms for HTTP responses.
-
-          If not specified, all supported algorithms are enabled.
-
-          Client `Accept-Encoding` quality values select among allowed algorithms; ties prefer zstd > br > gzip > deflate. Omitted quality values default to 1; without an acceptable allowed algorithm, the response is uncompressed. List order is ignored.
-
-          [possible values: zstd, gzip, deflate, br]
-
-      --http.decompression <ALGOS>
-          Comma-separated list of allowed decompression algorithms for HTTP requests.
-
-          Request decompression is disabled when not specified.
-
-          [possible values: zstd, gzip, deflate, br]
-
       --http.api <HTTP_API>
           Rpc Modules to be configured for the HTTP server
 
@@ -407,11 +391,6 @@ RPC:
 
           If no path is provided, a secret will be generated and stored in the datadir under `<DIR>/<CHAIN_ID>/jwt.hex`. For mainnet this would be `~/.local/share/reth/mainnet/jwt.hex` by default.
 
-      --authrpc.jwtsecret-hex <HEX>
-          Hex encoded JWT secret to use for the authenticated engine-API RPC server.
-
-          This will enforce JWT authentication for all requests coming from the consensus layer. Cannot be used together with `--authrpc.jwtsecret`.
-
       --auth-ipc
           Enable auth engine API over IPC
 
@@ -434,9 +413,7 @@ RPC:
           Disable built-in RPC request metrics
 
       --rpc.max-request-size <RPC_MAX_REQUEST_SIZE>
-          Set the maximum RPC request payload size for both HTTP and WS in megabytes.
-
-          For compressed HTTP requests, this limit applies to both the compressed and decompressed payloads.
+          Set the maximum RPC request payload size for both HTTP and WS in megabytes
 
           [default: 15]
 
@@ -444,7 +421,7 @@ RPC:
           Set the maximum RPC response payload size for both HTTP and WS in megabytes
 
           [default: 160]
-          [alias: --rpc.returndata.limit]
+          [aliases: --rpc.returndata.limit]
 
       --rpc.max-subscriptions-per-connection <RPC_MAX_SUBSCRIPTIONS_PER_CONNECTION>
           Set the maximum concurrent subscriptions per connection
@@ -544,8 +521,13 @@ RPC State Cache:
 
           [default: 2000]
 
+      --rpc-cache.max-headers <MAX_HEADERS>
+          Max number of headers in cache
+
+          [default: 1000]
+
       --rpc-cache.max-bals <MAX_BALS>
-          Max number of block access lists in cache
+          Max number of revm block access lists in cache
 
           [default: 1000]
 
@@ -836,49 +818,35 @@ Database:
           - trace:   Enables logging for trace debug-level messages
           - extra:   Enables logging for extra debug-level messages
 
-      --db.exclusive <EXCLUSIVE>
-          Open environment in exclusive/monopolistic mode. Makes it possible to open a database on an NFS volume
+      --db.block-cache-size <BLOCK_CACHE_SIZE>
+          Block cache size in bytes (e.g., 8GB, 4096MB). This is the LRU cache for uncompressed blocks. Higher values improve read performance. Default: 8GB
 
-          [possible values: true, false]
+      --db.write-buffer-size <WRITE_BUFFER_SIZE>
+          Write buffer size in bytes (e.g., 256MB, 512MB). Larger values improve write performance but use more memory. Default: 256MB
 
-      --db.max-size <MAX_SIZE>
-          Maximum database size (e.g., 4TB, 8TB).
+      --db.max-background-jobs <MAX_BACKGROUND_JOBS>
+          Maximum number of background jobs for compaction and flush. Higher values increase parallelism but use more CPU. Default: 14
 
-          This sets the "map size" of the database. If the database grows beyond this limit, the node will stop with an "environment map size limit reached" error.
+      --db.max-open-files <MAX_OPEN_FILES>
+          Maximum number of open files. Lower values if you hit OS file descriptor limits. Default: 10000
 
-          The default value is 8TB.
+      --db.max-write-buffer-number <MAX_WRITE_BUFFER_NUMBER>
+          Maximum number of write buffers (memtables). More buffers allow absorbing write spikes but use more memory. Default: 6
 
-      --db.page-size <PAGE_SIZE>
-          Database page size (e.g., 4KB, 8KB, 16KB).
+      --db.compaction-readahead-size <COMPACTION_READAHEAD_SIZE>
+          Compaction readahead size in bytes (e.g., 4MB, 8MB). Larger values improve compaction performance with sequential I/O. Default: 4MB
 
-          Specifies the page size used by the MDBX database.
+      --db.level0-file-num-compaction-trigger <LEVEL0_FILE_NUM_COMPACTION_TRIGGER>
+          Number of L0 files to trigger compaction. Lower values reduce read amplification but increase write amplification. Default: 4
 
-          The page size determines the maximum database size. MDBX supports up to 2^31 pages, so with the default 4KB page size, the maximum database size is 8TB. To allow larger databases, increase this value to 8KB or higher.
+      --db.max-bytes-for-level-base <MAX_BYTES_FOR_LEVEL_BASE>
+          Maximum bytes for level 1 (e.g., 512MB, 1GB). This controls the target size for L1, affecting LSM tree structure. Default: 512MB
 
-          WARNING: This setting is only configurable at database creation; changing it later requires re-syncing.
+      --db.bytes-per-sync <BYTES_PER_SYNC>
+          Bytes to write before background sync (e.g., 4MB, 8MB). Larger values reduce I/O overhead but may affect durability. Default: 4MB
 
-      --db.growth-step <GROWTH_STEP>
-          Database growth step (e.g., 4GB, 4KB)
-
-      --db.read-transaction-timeout <READ_TRANSACTION_TIMEOUT>
-          Read transaction timeout in seconds, 0 means no timeout
-
-      --db.max-readers <MAX_READERS>
-          Maximum number of readers allowed to access the database concurrently
-
-      --db.sync-mode <SYNC_MODE>
-          Controls how aggressively the database synchronizes data to disk
-
-      --db.rocksdb-block-cache-size <ROCKSDB_BLOCK_CACHE_SIZE>
-          `RocksDB` block cache size (e.g., 512MB, 4GB).
-
-          Controls the size of the in-memory LRU cache for decompressed `RocksDB` blocks. A larger cache reduces repeated decompression of hot blocks, improving read performance for history lookups.
-
-      --db.balstore-cache-size <BALSTORE_CACHE_SIZE>
-          Number of recent blocks to keep in the in-memory BAL store cache
-
-      --db.disable-metrics
-          Disable built-in database metrics
+      --db.sharding-directories <SHARDING_DIRECTORIES>
+          Semicolon separated `RocksDB` sharding directories. Accepts 2 or 3 paths. Always creates 3 databases (state, `account_trie`, `storage_trie`). - 0 paths (default): Creates subdirs under --datadir: state/, `account_trie`/, `storage_trie`/ - 2 paths: First dir contains state + `account_trie`; second dir contains `storage_trie` - 3 paths: First dir is state, second is `account_trie`, third is `storage_trie`
 
 Dev testnet:
       --dev
@@ -898,13 +866,6 @@ Dev testnet:
 
           Parses strings using [`humantime::parse_duration`]
           --dev.block-time 12s
-
-      --dev.finality-depth <FINALITY_DEPTH>
-          Number of confirmations required before a block is finalized.
-
-          A depth of `1` finalizes the canonical head immediately.
-
-          [default: 64]
 
       --dev.payload-wait-time <PAYLOAD_WAIT_TIME>
           Time to wait after initiating payload building before resolving.
@@ -996,32 +957,48 @@ Pruning:
       --prune.minimum-distance <BLOCKS>
           Minimum pruning distance from the tip. This controls the safety margin for reorgs and manual unwinds
 
+Liquent:
+      --liquent.disable-pipe-execution
+          Disable pipe execution. default false
+
+      --liquent.disable-levm
+          Disable the Levm executor. default false
+
+      --liquent.cache.max-persist-gap <CACHE_MAX_PERSIST_GAP>
+          The max block height between merged and pesist block height
+
+          [default: 128]
+
+      --liquent.persist.merge-blocks
+          Persist consecutive blocks in merged groups to amortize per-block fsyncs (much faster from-genesis catch-up). Incompatible with Storage V2. default false
+
+      --liquent.cache.capacity <CACHE_CAPACITY>
+          The max size of cached items
+
+          [default: 2000000]
+
+      --liquent.report-db-metrics
+          Report db metrics. default false
+
 Engine:
       --engine.persistence-threshold <PERSISTENCE_THRESHOLD>
           Configure persistence threshold for the engine. This determines how many canonical blocks must be in-memory, ahead of the last persisted block, before flushing canonical blocks to disk again.
 
           To persist blocks as fast as the node receives them, set this value to zero. This will cause more frequent DB writes.
 
-          [env: RETH_ENGINE_PERSISTENCE_THRESHOLD=]
-          [default: 7]
+          [default: 2]
 
       --engine.persistence-backpressure-threshold <PERSISTENCE_BACKPRESSURE_THRESHOLD>
-          Configure the maximum number of blocks beyond the in-memory buffer target that may await persistence before engine API processing stalls.
+          Configure the maximum canonical-minus-persisted gap before engine API processing stalls.
 
           If omitted, this defaults to the larger of the default backpressure threshold and twice `--engine.persistence-threshold`.
 
           This value must be greater than `--engine.persistence-threshold`.
 
-      --engine.num-state-masking-blocks <NUM_STATE_MASKING_BLOCKS>
-          EXPERIMENTAL: Configure how many of the blocks being persisted should only mask state/trie writes instead of durably persisting their state/trie updates in the current cycle
-
-          [env: RETH_ENGINE_NUM_STATE_MASKING_BLOCKS=]
-          [default: 0]
-
       --engine.memory-block-buffer-target <MEMORY_BLOCK_BUFFER_TARGET>
-          Configure the target number of blocks to keep in memory.
+          Configure the target number of blocks to keep in memory
 
-          If omitted, this defaults to the lesser of `--engine.persistence-threshold` and the configured default memory block buffer target.
+          [default: 0]
 
       --engine.invalid-header-cache-hit-eviction-threshold <INVALID_HEADER_HIT_EVICTION_THRESHOLD>
           Configure how many cache hits an invalid header can accumulate before it is evicted and reprocessed.
@@ -1030,21 +1007,17 @@ Engine:
 
           [default: 128]
 
+      --engine.legacy-state-root
+          Enable legacy state root
+
       --engine.disable-state-cache
           Disable state cache
 
       --engine.disable-prewarming
           Disable parallel prewarming
 
-      --engine.txpool-prewarming
-          Enable best-effort txpool transaction prewarming between payloads
-
-          [env: RETH_ENGINE_TXPOOL_PREWARMING=]
-
-      --engine.sender-recovery-cache
-          Enable caching recovered transaction senders across transaction ingress and payload execution
-
-          [env: RETH_ENGINE_SENDER_RECOVERY_CACHE=]
+      --engine.disable-parallel-sparse-trie
+          Disable the parallel sparse trie in the engine
 
       --engine.state-provider-metrics
           Enable state provider latency metrics. This allows the engine to collect and report stats about how long state provider calls took during execution, but this does introduce slight overhead to state provider calls
@@ -1096,14 +1069,20 @@ Engine:
       --engine.disable-cache-metrics
           Disable cache metrics recording, which can take up to 50ms with large cached state
 
-      --engine.slow-block-threshold <DURATION>
-          Configure the slow block logging threshold in milliseconds.
+      --engine.sparse-trie-max-hot-slots <SPARSE_TRIE_MAX_HOT_SLOTS>
+          LFU hot-slot capacity: max storage slots retained across sparse trie prune cycles
 
-          When set, blocks that take longer than this threshold to execute will be logged with detailed metrics including timing, state operations, and cache statistics.
+          [default: 1500]
 
-          Set to 0 to log all blocks (useful for debugging/profiling).
+      --engine.sparse-trie-max-hot-accounts <SPARSE_TRIE_MAX_HOT_ACCOUNTS>
+          LFU hot-account capacity: max account addresses retained across sparse trie prune cycles
 
-          When not set, slow block logging is disabled (default).
+          [default: 1000]
+
+      --engine.max-proof-task-concurrency <MAX_PROOF_TASK_CONCURRENCY>
+          Configure the maximum number of concurrent proof tasks
+
+          [default: 256]
 
       --engine.disable-sparse-trie-cache-pruning
           Fully disable sparse trie cache pruning. When set, the cached sparse trie is preserved without any node pruning or storage trie eviction between blocks. Useful for benchmarking the effects of retaining the full trie cache
@@ -1124,19 +1103,10 @@ Engine:
 
           Note: this should only be enabled if node would not be requested to process any payloads in parallel with payload building.
 
-      --engine.share-sparse-trie-with-payload-builder
-          Whether to share the sparse trie with the payload builder.
-
-          Replaces the payload builder's blocking `state_root_with_updates()` call with the sparse trie, computing the state root concurrently with transaction execution.
-
-          The engine and payload builder contend for the same trie — if a builder task is still running when `newPayload` arrives, the engine will block until the trie is stored back.
-
-          The builder also anchors the trie at the built block's state root, so if the next `newPayload` is not on top of that block, the trie cache is invalidated and cleared.
-
       --engine.suppress-persistence-during-build
           Suppress persistence while building a payload.
 
-          When enabled, persistence cycles are deferred while a payload build is active. Useful on chains with short block times where persistence I/O can interfere with block building latency.
+          When enabled, persistence cycles are deferred from the moment an FCU with payload attributes arrives until the next FCU clears the build. Useful on chains with short block times where persistence I/O can interfere with block building latency.
 
       --engine.disable-bal-parallel-execution
           Disable BAL (Block Access List, EIP-7928) based parallel execution
@@ -1183,54 +1153,36 @@ Static Files:
 
 Storage:
       --storage.v2 [<V2>]
-          Enable V2 (hot/cold) storage layout for new databases.
+          Enable the V2 storage layout (changesets in static files) for new databases.
 
-          When set, new databases will be initialized with the V2 storage layout that separates hot and cold data. Existing databases always use the settings persisted in their metadata regardless of this flag.
+          When set, new databases are initialized with account/storage changesets stored in static file segments instead of the state database. Existing databases always use the settings persisted in their metadata regardless of this flag.
 
-          [default: true]
+          [default: false]
           [possible values: true, false]
 
-JIT:
-      --jit
-          Enable JIT compilation of EVM bytecode
+Ress:
+      --ress.enable
+          Enable support for `ress` subprotocol
 
-      --jit.hot-threshold <HOT_THRESHOLD>
-          Number of observed misses before a bytecode is promoted to JIT compilation
+      --ress.max-active-connections <MAX_ACTIVE_CONNECTIONS>
+          The maximum number of active connections for `ress` subprotocol
 
-          [default: 8]
+          [default: 5]
 
-      --jit.worker-count <WORKER_COUNT>
-          Number of JIT compilation worker threads
+      --ress.max-witness-window <MAX_WITNESS_WINDOW>
+          The maximum witness lookback window
 
-      --jit.channel-capacity <CHANNEL_CAPACITY>
-          Capacity of the lookup-observed event channel. Events are silently dropped when the channel is full
+          [default: 1024]
 
-          [default: 4096]
+      --ress.witness-max-parallel <WITNESS_MAX_PARALLEL>
+          The maximum number of witnesses to generate in parallel
 
-      --jit.max-pending-jobs <MAX_PENDING_JOBS>
-          Maximum number of pending JIT compilation jobs
+          [default: 5]
 
-          [default: 2048]
+      --ress.witness-cache-size <WITNESS_CACHE_SIZE>
+          Witness cache size
 
-      --jit.max-bytecode-len <MAX_BYTECODE_LEN>
-          Maximum bytecode length eligible for JIT compilation. Contracts with bytecode larger than this are never promoted to JIT. 0 means no limit
-
-          [default: 0]
-
-      --jit.code-cache-bytes <CODE_CACHE_BYTES>
-          Maximum total resident compiled code size in bytes. When exceeded, the backend evicts least-recently-used entries. 0 means no limit
-
-          [default: 1073741824]
-
-      --jit.idle-evict-duration <IDLE_EVICT_DURATION>
-          Duration after which a compiled program with no lookup hits is evicted
-
-          [default: 1h]
-
-      --jit.debug
-          Enable compiler debug dumps.
-
-          IR, assembly, and bytecode are written to `<datadir>/jit/<spec_id>/<code_hash>/` for each compiled contract. Note that this is not ever cleaned up, and has a non negligible performance overhead.
+          [default: 10]
 
 Logging:
       --log.stdout.format <FORMAT>

@@ -9,7 +9,7 @@ use reth_storage_errors::provider::ProviderResult;
 
 /// Storage reader
 #[auto_impl::auto_impl(&, Arc, Box)]
-pub trait StorageReader: Send {
+pub trait StorageReader: Send + Sync {
     /// Get plainstate storages for addresses and storage keys.
     fn plain_state_storages(
         &self,
@@ -35,45 +35,50 @@ pub trait StorageReader: Send {
 /// Storage `ChangeSet` reader
 #[cfg(feature = "db-api")]
 #[auto_impl::auto_impl(&, Arc, Box)]
-pub trait StorageChangeSetReader: Send {
+pub trait StorageChangeSetReader: Send + Sync {
     /// Iterate over storage changesets and return the storage state from before this block.
     fn storage_changeset(
         &self,
         block_number: BlockNumber,
     ) -> ProviderResult<Vec<(reth_db_api::models::BlockNumberAddress, StorageEntry)>>;
+}
 
-    /// Search the block's changesets for the given address and storage key, and return the result.
-    ///
-    /// Returns `None` if the storage slot was not changed in this block.
-    fn get_storage_before_block(
+/// Reader for block-range changeset access, routed by the persisted storage layout.
+#[cfg(feature = "db-api")]
+#[auto_impl::auto_impl(&, Arc, Box)]
+pub trait ChangesetRangeReader: Send + Sync {
+    /// Collects account changesets in the block range.
+    fn account_changesets_range(
         &self,
-        block_number: BlockNumber,
-        address: Address,
-        storage_key: B256,
-    ) -> ProviderResult<Option<StorageEntry>>;
+        range: RangeInclusive<BlockNumber>,
+    ) -> ProviderResult<Vec<(BlockNumber, reth_db_api::models::AccountBeforeTx)>>;
 
-    /// Get all storage changesets in a range of blocks.
+    /// Collects storage changesets in the block range.
     fn storage_changesets_range(
         &self,
-        range: impl core::ops::RangeBounds<BlockNumber>,
+        range: RangeInclusive<BlockNumber>,
     ) -> ProviderResult<Vec<(reth_db_api::models::BlockNumberAddress, StorageEntry)>>;
+}
 
-    /// Get storage changesets for a block as static-file rows.
-    ///
-    /// Default implementation uses `storage_changeset` and maps to `StorageBeforeTx`.
-    fn storage_block_changeset(
-        &self,
-        block_number: BlockNumber,
-    ) -> ProviderResult<Vec<reth_db_models::StorageBeforeTx>> {
-        self.storage_changeset(block_number).map(|changesets| {
-            changesets
-                .into_iter()
-                .map(|(block_address, entry)| reth_db_models::StorageBeforeTx {
-                    address: block_address.address(),
-                    key: entry.key,
-                    value: entry.value,
-                })
-                .collect()
-        })
+/// An enum that represents the storage location for a piece of data.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum StorageLocation {
+    /// Write only to static files.
+    StaticFiles,
+    /// Write only to the database.
+    Database,
+    /// Write to both the database and static files.
+    Both,
+}
+
+impl StorageLocation {
+    /// Returns true if the storage location includes static files.
+    pub const fn static_files(&self) -> bool {
+        matches!(self, Self::StaticFiles | Self::Both)
+    }
+
+    /// Returns true if the storage location includes the database.
+    pub const fn database(&self) -> bool {
+        matches!(self, Self::Database | Self::Both)
     }
 }

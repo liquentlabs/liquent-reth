@@ -33,7 +33,7 @@ use reth_node_core::{
     primitives::Head,
 };
 use reth_provider::{
-    providers::{BlockchainProvider, NodeTypesForProvider, RocksDBProvider},
+    providers::{BlockchainProvider, NodeTypesForProvider},
     ChainSpecProvider, FullProvider,
 };
 use reth_tasks::TaskExecutor;
@@ -155,14 +155,12 @@ pub struct NodeBuilder<DB, ChainSpec> {
     config: NodeConfig<ChainSpec>,
     /// The configured database for the node.
     database: DB,
-    /// An optional [`RocksDBProvider`] to use instead of creating one during launch.
-    rocksdb_provider: Option<RocksDBProvider>,
 }
 
 impl<ChainSpec> NodeBuilder<(), ChainSpec> {
     /// Create a new [`NodeBuilder`].
     pub const fn new(config: NodeConfig<ChainSpec>) -> Self {
-        Self { config, database: (), rocksdb_provider: None }
+        Self { config, database: () }
     }
 }
 
@@ -231,13 +229,7 @@ impl<DB, ChainSpec> NodeBuilder<DB, ChainSpec> {
 impl<DB, ChainSpec: EthChainSpec> NodeBuilder<DB, ChainSpec> {
     /// Configures the underlying database that the node will use.
     pub fn with_database<D>(self, database: D) -> NodeBuilder<D, ChainSpec> {
-        NodeBuilder { config: self.config, database, rocksdb_provider: self.rocksdb_provider }
-    }
-
-    /// Sets the [`RocksDBProvider`] to use instead of creating one during launch.
-    pub fn with_rocksdb_provider(mut self, rocksdb_provider: RocksDBProvider) -> Self {
-        self.rocksdb_provider = Some(rocksdb_provider);
-        self
+        NodeBuilder { config: self.config, database }
     }
 
     /// Preconfigure the builder with the context to launch the node.
@@ -279,36 +271,9 @@ impl<DB, ChainSpec: EthChainSpec> NodeBuilder<DB, ChainSpec> {
         let data_dir =
             path.unwrap_or_chain_default(self.config.chain.chain(), self.config.datadir.clone());
 
-        let db = reth_db::test_utils::create_test_rw_db_with_datadir(data_dir.data_dir());
+        let db = reth_db::test_utils::create_test_rw_db_with_path(data_dir.db());
 
         WithLaunchContext { builder: self.with_database(db), task_executor }
-    }
-
-    /// Creates a preconfigured test node whose datadir is preserved when the node is dropped.
-    ///
-    /// The caller owns cleanup of `datadir`. This is useful for tests that stop a node and launch
-    /// a new instance against the same database and static files.
-    #[cfg(feature = "test-utils")]
-    pub fn testing_node_with_persistent_datadir(
-        mut self,
-        task_executor: TaskExecutor,
-        datadir: impl Into<std::path::PathBuf>,
-    ) -> WithLaunchContext<NodeBuilder<Arc<reth_db::DatabaseEnv>, ChainSpec>> {
-        let path = reth_node_core::dirs::MaybePlatformPath::<DataDirPath>::from(datadir.into());
-        self.config = self.config.with_datadir_args(reth_node_core::args::DatadirArgs {
-            datadir: path.clone(),
-            ..Default::default()
-        });
-
-        let data_dir =
-            path.unwrap_or_chain_default(self.config.chain.chain(), self.config.datadir.clone());
-        let db_path = data_dir.data_dir().join("db");
-        let db = reth_db::init_db(&db_path, reth_db::mdbx::DatabaseArguments::test())
-            .unwrap_or_else(|error| {
-                panic!("could not create test database at {db_path:?}: {error}")
-            });
-
-        WithLaunchContext { builder: self.with_database(Arc::new(db)), task_executor }
     }
 }
 
@@ -333,7 +298,7 @@ where
         T: NodeTypesForProvider<ChainSpec = ChainSpec>,
         P: FullProvider<NodeTypesWithDBAdapter<T, DB>>,
     {
-        NodeBuilderWithTypes::new(self.config, self.database, self.rocksdb_provider)
+        NodeBuilderWithTypes::new(self.config, self.database)
     }
 
     /// Preconfigures the node with a specific node implementation.
@@ -383,12 +348,6 @@ where
     DB: Database + DatabaseMetrics + Clone + Unpin + 'static,
     ChainSpec: EthChainSpec + EthereumHardforks,
 {
-    /// Sets the [`RocksDBProvider`] to use instead of creating one during launch.
-    pub fn with_rocksdb_provider(mut self, rocksdb_provider: RocksDBProvider) -> Self {
-        self.builder.rocksdb_provider = Some(rocksdb_provider);
-        self
-    }
-
     /// Configures the types of the node.
     pub fn with_types<T>(self) -> WithLaunchContext<NodeBuilderWithTypes<RethFullAdapter<DB, T>>>
     where
@@ -746,7 +705,7 @@ where
     {
         let Self { builder, task_executor } = self;
 
-        let engine_tree_config = builder.config.tree_config();
+        let engine_tree_config = builder.config.engine.tree_config();
 
         let launcher = DebugNodeLauncher::new(EngineNodeLauncher::new(
             task_executor,
@@ -759,7 +718,7 @@ where
     /// Returns an [`EngineNodeLauncher`] that can be used to launch the node with engine API
     /// support.
     pub fn engine_api_launcher(&self) -> EngineNodeLauncher {
-        let engine_tree_config = self.builder.config.tree_config();
+        let engine_tree_config = self.builder.config.engine.tree_config();
         EngineNodeLauncher::new(
             self.task_executor.clone(),
             self.builder.config.datadir(),
@@ -778,24 +737,17 @@ pub struct BuilderContext<Node: FullNodeTypes> {
     pub(crate) executor: TaskExecutor,
     /// Config container
     pub(crate) config_container: WithConfigs<<Node::Types as NodeTypes>::ChainSpec>,
-    /// Cache of recovered transaction senders shared by node components, if enabled.
-    sender_recovery_cache: Option<reth_evm::SenderRecoveryCache>,
 }
 
 impl<Node: FullNodeTypes> BuilderContext<Node> {
     /// Create a new instance of [`BuilderContext`]
-    pub fn new(
+    pub const fn new(
         head: Head,
         provider: Node::Provider,
         executor: TaskExecutor,
         config_container: WithConfigs<<Node::Types as NodeTypes>::ChainSpec>,
     ) -> Self {
-        let sender_recovery_cache = config_container
-            .config
-            .engine
-            .sender_recovery_cache_enabled
-            .then(reth_evm::SenderRecoveryCache::default);
-        Self { head, provider, executor, config_container, sender_recovery_cache }
+        Self { head, provider, executor, config_container }
     }
 
     /// Returns the configured provider to interact with the blockchain.
@@ -828,11 +780,6 @@ impl<Node: FullNodeTypes> BuilderContext<Node> {
     /// This can be used to execute async tasks or functions during the setup.
     pub const fn task_executor(&self) -> &TaskExecutor {
         &self.executor
-    }
-
-    /// Returns the sender recovery cache shared by node components, if enabled.
-    pub const fn sender_recovery_cache(&self) -> Option<&reth_evm::SenderRecoveryCache> {
-        self.sender_recovery_cache.as_ref()
     }
 
     /// Returns the chain spec of the node.
@@ -959,13 +906,6 @@ impl<Node: FullNodeTypes> BuilderContext<Node> {
                 propagation_policy,
                 announcement_policy,
             )
-            .map_transactions(|transactions| {
-                if let Some(cache) = self.sender_recovery_cache.clone() {
-                    transactions.with_sender_recovery_cache(cache)
-                } else {
-                    transactions
-                }
-            })
             .request_handler_with_blob_store(self.provider().clone(), pool.blob_store())
             .split_with_handle();
 
@@ -1067,31 +1007,5 @@ impl<Node: FullNodeTypes> std::fmt::Debug for BuilderContext<Node> {
             .field("executor", &self.executor)
             .field("config", &self.config())
             .finish()
-    }
-}
-
-#[cfg(all(test, feature = "test-utils"))]
-mod tests {
-    use super::*;
-    use reth_chainspec::ChainSpec;
-    use reth_tasks::Runtime;
-
-    #[test]
-    fn persistent_test_datadir_can_be_reopened() {
-        let root = tempfile::tempdir().unwrap();
-        let datadir = root.path().join("node");
-        let runtime = Runtime::test();
-
-        let config = || NodeConfig::new(Arc::new(ChainSpec::<alloy_consensus::Header>::default()));
-        let first = NodeBuilder::new(config())
-            .testing_node_with_persistent_datadir(runtime.clone(), datadir.clone());
-        assert!(datadir.join("db").exists());
-        drop(first);
-        assert!(datadir.join("db").exists());
-
-        let reopened = NodeBuilder::new(config())
-            .testing_node_with_persistent_datadir(runtime, datadir.clone());
-        drop(reopened);
-        assert!(datadir.join("db").exists());
     }
 }

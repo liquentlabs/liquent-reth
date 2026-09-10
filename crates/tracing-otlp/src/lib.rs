@@ -87,7 +87,6 @@ pub fn log_layer(
         opentelemetry_sdk::logs::SdkLogger,
     >,
 > {
-    use opentelemetry_appender_tracing::layer::TracingSpanAttributes;
     use opentelemetry_otlp::LogExporter;
     use opentelemetry_sdk::logs::SdkLoggerProvider;
 
@@ -110,9 +109,7 @@ pub fn log_layer(
         .with_batch_exporter(log_exporter)
         .build();
 
-    Ok(opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::builder(&logger_provider)
-        .with_tracing_span_attributes(TracingSpanAttributes::all())
-        .build())
+    Ok(opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&logger_provider))
 }
 
 /// Configuration for OTLP trace export.

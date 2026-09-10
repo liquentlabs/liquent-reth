@@ -2,13 +2,14 @@ use super::BalExecutionError;
 use alloy_consensus::Transaction;
 use alloy_eip7928::BlockAccessIndex;
 use alloy_evm::{
-    block::{BlockExecutionError, BlockExecutor, BlockExecutorFactory, BlockValidationError},
+    block::{BlockExecutionError, BlockExecutor, BlockExecutorFactory},
     Evm,
 };
 use alloy_primitives::Address;
 use crossbeam_channel::{Receiver, Sender};
 use reth_evm::{execute::ExecutableTxFor, ConfigureEvm, Database, EvmEnvFor, ExecutionCtxFor};
-use revm::{database::State, state::bal::Bal as RevmBal};
+use revm::database::State;
+use revm_state::bal::Bal as RevmBal;
 use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
@@ -28,9 +29,7 @@ impl From<BalWorkerError> for BalExecutionError {
     fn from(err: BalWorkerError) -> Self {
         match err {
             BalWorkerError::Setup(err) => err,
-            BalWorkerError::Transaction(err) => {
-                Self::Execution(BlockValidationError::Other(err).into())
-            }
+            BalWorkerError::Transaction(err) => Self::Other(err),
             BalWorkerError::Execution(err) => Self::Execution(err),
         }
     }
@@ -92,10 +91,7 @@ pub(super) fn spawn_worker<'scope, Evm, Tx, Err, DB, MakeDb>(
                 let signer = *tx.signer();
                 let tx_gas_limit = tx.tx().gas_limit();
 
-                executor
-                    .evm_mut()
-                    .db_mut()
-                    .set_bal_index(BlockAccessIndex::from_tx_index(index as u64));
+                executor.evm_mut().db_mut().set_bal_index(BlockAccessIndex::new(index as u64 + 1));
                 let result = executor
                     .execute_transaction_without_commit(tx)
                     .map_err(BalWorkerError::Execution)?;

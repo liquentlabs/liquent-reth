@@ -95,13 +95,9 @@ impl MetricServer {
         } = &self.config;
 
         let hooks_for_endpoint = hooks.clone();
-        let executor_for_hooks = task_executor.clone();
         self.start_endpoint(
             *listen_addr,
-            Arc::new(move || {
-                hooks_for_endpoint.refresh_background(&executor_for_hooks);
-                hooks_for_endpoint.iter().for_each(|hook| hook());
-            }),
+            Arc::new(move || hooks_for_endpoint.iter().for_each(|hook| hook())),
             task_executor.clone(),
             pprof_dump_dir.clone(),
         )
@@ -149,7 +145,6 @@ impl MetricServer {
 
         tracing::info!(target: "reth::cli", "Starting metrics endpoint at {}", listener.local_addr().unwrap());
 
-        let executor = task_executor.clone();
         task_executor.spawn_with_graceful_shutdown_signal(async move |mut signal| loop {
             let io = tokio::select! {
                 _ = &mut signal => break,
@@ -167,15 +162,12 @@ impl MetricServer {
             let handle = install_prometheus_recorder();
             let hook = hook.clone();
             let pprof_dump_dir = pprof_dump_dir.clone();
-            let executor = executor.clone();
             let service = tower::service_fn(move |req: Request<_>| {
                 let hook = hook.clone();
                 let pprof_dump_dir = pprof_dump_dir.clone();
-                let executor = executor.clone();
                 async move {
                     let response =
-                        handle_request(req.uri().path(), hook, executor, handle, &pprof_dump_dir)
-                            .await;
+                        handle_request(req.uri().path(), &*hook, handle, &pprof_dump_dir).await;
                     Ok::<_, Infallible>(response)
                 }
             });
@@ -202,7 +194,6 @@ impl MetricServer {
         let client = Client::builder()
             .build()
             .wrap_err("Could not create HTTP client to push metrics to gateway")?;
-        let executor = task_executor.clone();
         task_executor.spawn_with_graceful_shutdown_signal(async move |mut signal| {
             tracing::info!(url = %url, interval = ?interval, "Starting task to push metrics to gateway");
             let handle = install_prometheus_recorder();
@@ -213,19 +204,8 @@ impl MetricServer {
                         break;
                     }
                     _ = tokio::time::sleep(interval) => {
-                        hooks.refresh_background(&executor);
-                        let hooks = hooks.clone();
-                        let metrics_handle = handle.handle().clone();
-                        let metrics = match executor.spawn_blocking(move || {
-                            hooks.iter().for_each(|hook| hook());
-                            metrics_handle.render()
-                        }).await {
-                            Ok(metrics) => metrics,
-                            Err(err) => {
-                                tracing::warn!(%err, "Failed to collect metrics for gateway");
-                                continue;
-                            }
-                        };
+                        hooks.iter().for_each(|hook| hook());
+                        let metrics = handle.handle().render();
                         match client.put(&url).header("Content-Type", "text/plain").body(metrics).send().await {
                             Ok(response) => {
                                 if !response.status().is_success() {
@@ -347,10 +327,9 @@ fn describe_io_stats() {
 #[cfg(not(target_os = "linux"))]
 const fn describe_io_stats() {}
 
-async fn handle_request<F: Hook>(
+async fn handle_request(
     path: &str,
-    hook: Arc<F>,
-    executor: TaskExecutor,
+    hook: impl Fn(),
     handle: &crate::recorder::PrometheusRecorder,
     pprof_dump_dir: &PathBuf,
 ) -> Response<Full<Bytes>> {
@@ -358,23 +337,8 @@ async fn handle_request<F: Hook>(
         "/debug/pprof/heap" => handle_pprof_heap(pprof_dump_dir),
         "/debug/tokio/dump" => handle_tokio_dump().await,
         _ => {
-            let metrics_handle = handle.handle().clone();
-            let metrics = match executor
-                .spawn_blocking(move || {
-                    hook();
-                    metrics_handle.render()
-                })
-                .await
-            {
-                Ok(metrics) => metrics,
-                Err(err) => {
-                    let mut response = Response::new(Full::new(Bytes::from(format!(
-                        "Failed to collect metrics: {err}"
-                    ))));
-                    *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
-                    return response;
-                }
-            };
+            hook();
+            let metrics = handle.handle().render();
             let mut response = Response::new(Full::new(Bytes::from(metrics)));
             response.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
             response
@@ -461,7 +425,11 @@ fn handle_pprof_heap(_pprof_dump_dir: &PathBuf) -> Response<Full<Bytes>> {
     response
 }
 
-#[cfg(tokio_unstable)]
+#[cfg(all(
+    tokio_unstable,
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+))]
 async fn handle_tokio_dump() -> Response<Full<Bytes>> {
     let handle = tokio::runtime::Handle::current();
     let dump = handle.dump().await;
@@ -477,7 +445,11 @@ async fn handle_tokio_dump() -> Response<Full<Bytes>> {
     response
 }
 
-#[cfg(not(tokio_unstable))]
+#[cfg(not(all(
+    tokio_unstable,
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+)))]
 async fn handle_tokio_dump() -> Response<Full<Bytes>> {
     let mut response = Response::new(Full::new(Bytes::from_static(
         b"tokio task dump not available. Rebuild with RUSTFLAGS=\"--cfg tokio_unstable\" and tokio's `taskdump` feature.",
@@ -492,13 +464,7 @@ mod tests {
     use reqwest::Client;
     use reth_tasks::Runtime;
     use socket2::{Domain, Socket, Type};
-    use std::{
-        net::{SocketAddr, TcpListener},
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            mpsc, Mutex,
-        },
-    };
+    use std::net::{SocketAddr, TcpListener};
 
     fn get_random_available_addr() -> SocketAddr {
         let addr = &"127.0.0.1:0".parse::<SocketAddr>().unwrap().into();
@@ -564,77 +530,6 @@ mod tests {
         assert!(body.contains("prune_config="), "expected prune config label");
 
         // Make sure the runtime is dropped after the test runs.
-        drop(runtime);
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_background_hooks_do_not_block_collection() {
-        install_prometheus_recorder();
-
-        let collections = Arc::new(AtomicUsize::new(0));
-        let (release, wait_for_release) = mpsc::channel();
-        let wait_for_release = Mutex::new(Some(wait_for_release));
-        let completed = Arc::new(tokio::sync::Notify::new());
-        let hooks = Hooks::builder()
-            .with_background_interval(Duration::from_secs(60))
-            .with_background_hook({
-                let collections = collections.clone();
-                let completed = completed.clone();
-                move || {
-                    // Dropping the sender also unblocks the hook if a scrape assertion fails.
-                    if let Some(wait_for_release) = wait_for_release.lock().unwrap().take() &&
-                        wait_for_release.recv().is_err()
-                    {
-                        return
-                    }
-                    let collections = collections.fetch_add(1, Ordering::Relaxed) + 1;
-                    metrics::gauge!("test_background_hook_collections").set(collections as f64);
-                    completed.notify_one();
-                }
-            })
-            .build();
-
-        let runtime = Runtime::test();
-        let listen_addr = get_random_available_addr();
-        let config = MetricServerConfig::new(
-            listen_addr,
-            VersionInfo {
-                version: "test",
-                build_timestamp: "test",
-                cargo_features: "test",
-                git_sha: "test",
-                target_triple: "test",
-                build_profile: "test",
-            },
-            ChainSpecInfo { name: "test".to_string() },
-            runtime.clone(),
-            hooks,
-            std::env::temp_dir(),
-        );
-
-        MetricServer::new(config).serve().await.unwrap();
-
-        // the first scrape kicks off the background hook but must not wait for it
-        let url = format!("http://{listen_addr}");
-        let started = std::time::Instant::now();
-        let response =
-            Client::new().get(&url).timeout(Duration::from_millis(500)).send().await.unwrap();
-        assert!(response.status().is_success());
-        assert!(started.elapsed() < Duration::from_secs(1), "scrape waited for the hook");
-        assert_eq!(collections.load(Ordering::Relaxed), 0);
-
-        // once it completes, its values are rendered by the following scrape
-        release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), completed.notified()).await.unwrap();
-        let body = Client::new().get(&url).send().await.unwrap().text().await.unwrap();
-        assert!(
-            body.contains("test_background_hook_collections"),
-            "background hook metric missing: {body}"
-        );
-
-        // and scrapes within the interval do not collect again
-        assert_eq!(collections.load(Ordering::Relaxed), 1);
-
         drop(runtime);
     }
 }

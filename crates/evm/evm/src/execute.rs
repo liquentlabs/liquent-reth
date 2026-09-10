@@ -8,6 +8,7 @@ use alloy_eips::eip2718::WithEncoded;
 pub use alloy_evm::block::{BlockExecutor, BlockExecutorFactory, GasOutput};
 use alloy_evm::{
     block::{CommitChanges, ExecutableTxParts},
+    precompiles::{DynPrecompile, PrecompilesMap},
     Evm, EvmEnv, EvmFactory, RecoveredTx, ToTxEnv,
 };
 use alloy_primitives::{Address, B256};
@@ -23,8 +24,13 @@ use reth_storage_api::StateProvider;
 pub use reth_storage_errors::provider::ProviderError;
 use reth_trie_common::{updates::TrieUpdates, HashedPostState};
 use revm::{
+    context::{
+        result::{ExecutionResult, HaltReason},
+        TxEnv,
+    },
     database::{states::bundle_state::BundleRetention, BundleState, State},
-    state::bal::Bal,
+    state::{AccountInfo, EvmState},
+    Database as RevmDatabase, DatabaseCommit,
 };
 
 /// A type that knows how to execute a block. It is assumed to operate on a
@@ -145,13 +151,62 @@ pub trait Executor<DB: Database>: Sized {
     /// Consumes the executor and returns the [`State`] containing all state changes.
     fn into_state(self) -> State<DB>;
 
+    /// Takes the `BundleState` changeset from the State, replacing it with an empty one.
+    fn take_bundle(&mut self) -> BundleState;
+
     /// The size hint of the batch's tracked state size.
     ///
     /// This is used to optimize DB commits depending on the size of the state.
     fn size_hint(&self) -> usize;
 
+    /// Executes a single system transaction on the executor's own internal state and commits
+    /// the resulting state changes immediately.
+    fn transact_system_txn(
+        &mut self,
+        evm_env: EvmEnv,
+        precompiles: Vec<(Address, DynPrecompile)>,
+        tx_env: TxEnv,
+    ) -> Result<ExecutionResult<HaltReason>, Self::Error>;
+
+    /// Applies an irregular state change (e.g. a fork-block contract deployment) directly to
+    /// the executor's in-memory state, bypassing normal transaction execution. The state diff
+    /// is committed immediately; the resulting transitions land in the bundle returned by
+    /// [`take_bundle`].
+    ///
+    /// Used for state mutations that are inherently not transaction-shaped (e.g. the EIP-2935
+    /// `HISTORY_STORAGE` deployment at the Prague activation block, where `CREATE` / `CREATE2`
+    /// cannot target the canonical address without owning a mined deployer key).
+    ///
+    /// [`take_bundle`]: Self::take_bundle
+    fn apply_state_change(&mut self, state_diff: EvmState) -> Result<(), Self::Error>;
+
+    /// Reads the current `AccountInfo` for `address` from the executor's in-memory state
+    /// without committing any change. Used by irregular-state-change hooks that need to
+    /// inspect existing nonce / code to preserve them in the diff they then submit via
+    /// [`apply_state_change`](Self::apply_state_change) (e.g. the Liquent Alpha
+    /// `SYSTEM_CALLER` balance migration in
+    /// `pipe-exec-layer-ext-v2/.../system_caller_migration.rs`).
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error>;
+
+    /// Registers custom precompiles for subsequent user transaction execution.
+    fn apply_custom_precompiles(&mut self, custom_precompiles: Arc<Vec<(Address, DynPrecompile)>>);
+
     /// Takes built [`BlockAccessList`] from executor.
-    fn take_bal(&mut self) -> Option<BlockAccessList>;
+    ///
+    /// Defaults to `None`: executors that never build a BAL (liquent has no Amsterdam
+    /// activation) rely on the default.
+    fn take_bal(&mut self) -> Option<BlockAccessList> {
+        None
+    }
+}
+
+/// Helper type for the output of executing a block.
+#[derive(Debug, Clone)]
+pub struct ExecuteOutput<R> {
+    /// Receipts obtained after executing a block.
+    pub receipts: Vec<R>,
+    /// Cumulative gas used in the block execution.
+    pub gas_used: u64,
 }
 
 /// Input for block building. Consumed by [`BlockAssembler`].
@@ -514,8 +569,7 @@ where
         let block_access_list_hash =
             block_access_list.as_ref().map(|bal| compute_block_access_list_hash(bal.as_slice()));
 
-        let hashed_state =
-            state.hashed_post_state(&db.bundle_state).map_err(BlockExecutionError::other)?;
+        let hashed_state = state.hashed_post_state(&db.bundle_state);
         let (state_root, trie_updates) = match state_root_precomputed {
             Some(precomputed) => precomputed,
             None => state
@@ -570,13 +624,15 @@ pub struct BasicBlockExecutor<F, DB> {
     pub(crate) strategy_factory: F,
     /// Database.
     pub(crate) db: State<DB>,
+    /// Custom precompiled contracts to inject into user transaction execution.
+    pub(crate) custom_precompiles: Option<Arc<Vec<(Address, DynPrecompile)>>>,
 }
 
 impl<F, DB: Database> BasicBlockExecutor<F, DB> {
     /// Creates a new `BasicBlockExecutor` with the given strategy.
     pub fn new(strategy_factory: F, db: DB) -> Self {
         let db = State::builder().with_database(db).with_bundle_update().build();
-        Self { strategy_factory, db }
+        Self { strategy_factory, db, custom_precompiles: None }
     }
 }
 
@@ -593,33 +649,17 @@ where
         block: &RecoveredBlock<<Self::Primitives as NodePrimitives>::Block>,
     ) -> Result<BlockExecutionResult<<Self::Primitives as NodePrimitives>::Receipt>, Self::Error>
     {
-        let mut executor = self
+        let custom_precompiles = self.custom_precompiles.clone();
+        let evm_env =
+            self.strategy_factory.evm_env(block.header()).map_err(BlockExecutionError::other)?;
+        let mut evm = self.strategy_factory.evm_with_env(&mut self.db, evm_env);
+        apply_custom_precompiles_to_evm(&mut evm, custom_precompiles.as_deref());
+        let ctx =
+            self.strategy_factory.context_for_block(block).map_err(BlockExecutionError::other)?;
+        let result = self
             .strategy_factory
-            .executor_for_block(&mut self.db, block)
-            .map_err(BlockExecutionError::other)?;
-
-        let has_bal = block.header().block_access_list_hash().is_some();
-
-        if has_bal {
-            executor.evm_mut().db_mut().bal_state.bal_builder = Some(Bal::new());
-        } else {
-            executor.evm_mut().db_mut().bal_state.bal_builder = None;
-        }
-
-        executor.apply_pre_execution_changes()?;
-
-        if has_bal {
-            executor.evm_mut().db_mut().bump_bal_index();
-        }
-
-        for tx in block.transactions_recovered() {
-            executor.execute_transaction(tx)?;
-            if has_bal {
-                executor.evm_mut().db_mut().bump_bal_index();
-            }
-        }
-
-        let result = executor.apply_post_execution_changes()?;
+            .create_executor(evm, ctx)
+            .execute_block(block.transactions_recovered())?;
 
         self.db.merge_transitions(BundleRetention::Reverts);
 
@@ -634,11 +674,14 @@ where
     where
         H: OnStateHook + 'static,
     {
-        let mut executor = self
-            .strategy_factory
-            .executor_for_block(&mut self.db, block)
-            .map_err(BlockExecutionError::other)?;
-
+        let custom_precompiles = self.custom_precompiles.clone();
+        let evm_env =
+            self.strategy_factory.evm_env(block.header()).map_err(BlockExecutionError::other)?;
+        let mut evm = self.strategy_factory.evm_with_env(&mut self.db, evm_env);
+        apply_custom_precompiles_to_evm(&mut evm, custom_precompiles.as_deref());
+        let ctx =
+            self.strategy_factory.context_for_block(block).map_err(BlockExecutionError::other)?;
+        let mut executor = self.strategy_factory.create_executor(evm, ctx);
         executor.evm_mut().db_mut().set_state_hook(Some(Box::new(state_hook)));
 
         let result = executor.execute_block(block.transactions_recovered());
@@ -653,12 +696,66 @@ where
         self.db
     }
 
+    fn take_bundle(&mut self) -> BundleState {
+        self.db.merge_transitions(BundleRetention::Reverts);
+        self.db.take_bundle()
+    }
+
     fn size_hint(&self) -> usize {
         self.db.bundle_state.size_hint()
     }
 
+    fn transact_system_txn(
+        &mut self,
+        evm_env: EvmEnv,
+        precompiles: Vec<(Address, DynPrecompile)>,
+        tx_env: TxEnv,
+    ) -> Result<ExecutionResult<HaltReason>, Self::Error> {
+        self.strategy_factory.transact_system_txn(&mut self.db, evm_env, precompiles, tx_env)
+    }
+
+    fn apply_state_change(&mut self, state_diff: EvmState) -> Result<(), Self::Error> {
+        // revm's `State::commit` (via `CacheState`) panics with "All accounts
+        // should be present inside cache" if a touched address has never been
+        // loaded. Irregular state changes (e.g. EIP-2935 HISTORY_STORAGE
+        // deployment at the Prague activation block) introduce brand-new
+        // accounts that no prior transaction has read. Pre-load each touched
+        // address via `basic` so the cache holds an entry before commit runs.
+        // The levm path (`LevmExecutor::apply_state_change` in
+        // `crates/ethereum/evm/src/parallel_execute.rs`) needs the same fix.
+        for addr in state_diff.keys().copied() {
+            RevmDatabase::basic(&mut self.db, addr).map_err(|e| {
+                BlockExecutionError::msg(alloc::format!("apply_state_change preload {addr}: {e:?}"))
+            })?;
+        }
+        self.db.commit(state_diff);
+        Ok(())
+    }
+
+    fn basic(&mut self, address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+        RevmDatabase::basic(&mut self.db, address)
+            .map_err(|e| BlockExecutionError::msg(alloc::format!("basic {address}: {e:?}")))
+    }
+
+    fn apply_custom_precompiles(&mut self, custom_precompiles: Arc<Vec<(Address, DynPrecompile)>>) {
+        self.custom_precompiles = Some(custom_precompiles);
+    }
+
     fn take_bal(&mut self) -> Option<BlockAccessList> {
         self.db.take_built_alloy_bal()
+    }
+}
+
+fn apply_custom_precompiles_to_evm<Evm>(
+    evm: &mut Evm,
+    custom_precompiles: Option<&Vec<(Address, DynPrecompile)>>,
+) where
+    Evm: crate::Evm<Precompiles = PrecompilesMap>,
+{
+    if let Some(custom_precompiles) = custom_precompiles {
+        for (addr, precompile) in custom_precompiles.iter().cloned() {
+            evm.precompiles_mut().apply_precompile(&addr, move |_| Some(precompile));
+        }
     }
 }
 
@@ -725,9 +822,13 @@ impl<TxEnv, T: RecoveredTx<Tx>, Tx> ExecutableTxParts<TxEnv, Tx> for WithTxEnv<T
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Address;
     use core::marker::PhantomData;
     use reth_ethereum_primitives::EthPrimitives;
-    use revm::database::{CacheDB, EmptyDB};
+    use revm::{
+        database::{CacheDB, EmptyDB},
+        state::AccountInfo,
+    };
 
     #[derive(Clone, Debug, Default)]
     struct TestExecutorProvider;
@@ -770,12 +871,35 @@ mod tests {
             unreachable!()
         }
 
+        fn take_bundle(&mut self) -> BundleState {
+            unreachable!()
+        }
+
         fn size_hint(&self) -> usize {
             0
         }
 
-        fn take_bal(&mut self) -> Option<BlockAccessList> {
-            None
+        fn transact_system_txn(
+            &mut self,
+            _evm_env: EvmEnv,
+            _precompiles: Vec<(Address, DynPrecompile)>,
+            _tx_env: TxEnv,
+        ) -> Result<ExecutionResult<HaltReason>, Self::Error> {
+            unreachable!()
+        }
+
+        fn apply_state_change(&mut self, _state_diff: EvmState) -> Result<(), Self::Error> {
+            unreachable!()
+        }
+
+        fn basic(&mut self, _address: Address) -> Result<Option<AccountInfo>, Self::Error> {
+            unreachable!()
+        }
+
+        fn apply_custom_precompiles(
+            &mut self,
+            _custom_precompiles: Arc<Vec<(Address, DynPrecompile)>>,
+        ) {
         }
     }
 

@@ -148,7 +148,6 @@ impl SessionError for EthStreamError {
                                     DisconnectReason::ProtocolBreach
                             )
                     ) | P2PStreamError::UnknownReservedMessageId(_) |
-                        P2PStreamError::UnknownSubprotocolMessageId(_) |
                         P2PStreamError::EmptyProtocolMessage |
                         P2PStreamError::ParseSharedCapability(_) |
                         P2PStreamError::CapabilityNotShared |
@@ -217,23 +216,16 @@ impl SessionError for EthStreamError {
                 P2PStreamError::HandshakeError(P2PHandshakeError::NoResponse) |
                 P2PStreamError::PingTimeout,
             ) => Some(BackoffKind::Low),
-            // malformed or abusive messages
+            // malformed messages
             Self::P2PStreamError(
                 P2PStreamError::Rlp(_) |
                 P2PStreamError::UnknownReservedMessageId(_) |
-                P2PStreamError::UnknownSubprotocolMessageId(_) |
                 P2PStreamError::UnknownDisconnectReason(_) |
                 P2PStreamError::MessageTooBig { .. } |
-                P2PStreamError::SubprotocolMessageTooBig { .. } |
                 P2PStreamError::EmptyProtocolMessage |
-                P2PStreamError::InvalidPingPongPayload(_) |
-                P2PStreamError::TooManyPings |
                 P2PStreamError::PingerError(_) |
                 P2PStreamError::Snap(_),
             ) => Some(BackoffKind::Medium),
-            Self::P2PStreamError(P2PStreamError::SubprotocolInboundBufferFull { .. }) => {
-                Some(BackoffKind::Low)
-            }
             Self::EthHandshakeError(EthHandshakeError::InvalidFork(_)) => {
                 // the remote can come back online after updating client version, so we can back off
                 // for a bit
@@ -259,9 +251,6 @@ impl SessionError for PendingSessionHandshakeError {
                     ECIESErrorImpl::Secp256k1(_) |
                     ECIESErrorImpl::InvalidHandshake { .. }
             ),
-            // A peer that announces someone else's node id is broken or hostile, and its discovery
-            // record cannot be trusted to point at a usable peer.
-            Self::UnexpectedHandshakeIdentity(_) => true,
             Self::Timeout | Self::UnsupportedExtraCapability => false,
         }
     }
@@ -281,7 +270,7 @@ impl SessionError for PendingSessionHandshakeError {
                     ECIESErrorImpl::InvalidHandshake { .. }
             ),
             Self::Timeout => false,
-            Self::UnsupportedExtraCapability | Self::UnexpectedHandshakeIdentity(_) => true,
+            Self::UnsupportedExtraCapability => true,
         }
     }
 
@@ -290,9 +279,7 @@ impl SessionError for PendingSessionHandshakeError {
             Self::Eth(eth) => eth.should_backoff(),
             Self::Ecies(_) => Some(BackoffKind::Low),
             Self::Timeout => Some(BackoffKind::Medium),
-            Self::UnsupportedExtraCapability | Self::UnexpectedHandshakeIdentity(_) => {
-                Some(BackoffKind::High)
-            }
+            Self::UnsupportedExtraCapability => Some(BackoffKind::High),
         }
     }
 }
@@ -350,38 +337,6 @@ mod tests {
             P2PHandshakeError::NoResponse,
         ));
         assert_eq!(err.should_backoff(), Some(BackoffKind::Low));
-
-        let err = EthStreamError::P2PStreamError(P2PStreamError::InvalidPingPongPayload(0x02));
-        assert_eq!(err.should_backoff(), Some(BackoffKind::Medium));
-
-        let err = EthStreamError::P2PStreamError(P2PStreamError::TooManyPings);
-        assert!(err.is_protocol_breach());
-        assert_eq!(err.should_backoff(), Some(BackoffKind::Medium));
-    }
-
-    #[test]
-    fn subprotocol_ingress_errors_have_distinct_reputation_outcomes() {
-        let capability = reth_eth_wire::Capability::new_static("test", 1);
-        let unknown =
-            EthStreamError::P2PStreamError(P2PStreamError::UnknownSubprotocolMessageId(0xff));
-        assert!(unknown.is_protocol_breach());
-        assert!(unknown.is_fatal_protocol_error());
-
-        let oversized = EthStreamError::P2PStreamError(P2PStreamError::SubprotocolMessageTooBig {
-            capability: capability.clone(),
-            message_size: 5,
-            max_size: 4,
-        });
-        assert!(!oversized.is_protocol_breach());
-        assert!(!oversized.is_fatal_protocol_error());
-        assert_eq!(oversized.should_backoff(), Some(BackoffKind::Medium));
-
-        let full = EthStreamError::P2PStreamError(P2PStreamError::SubprotocolInboundBufferFull {
-            capability,
-        });
-        assert!(!full.is_protocol_breach());
-        assert!(!full.is_fatal_protocol_error());
-        assert_eq!(full.should_backoff(), Some(BackoffKind::Low));
     }
 
     #[test]

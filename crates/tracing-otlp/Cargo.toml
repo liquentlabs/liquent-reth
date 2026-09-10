@@ -42,7 +42,6 @@ otlp = [
 otlp-logs = [
     "otlp",
     "opentelemetry-appender-tracing",
-    "opentelemetry-appender-tracing/experimental_span_attributes",
     "opentelemetry-otlp/logs",
     "opentelemetry_sdk/logs",
 ]

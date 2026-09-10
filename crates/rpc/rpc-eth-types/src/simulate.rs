@@ -12,9 +12,9 @@ use alloy_network::{NetworkTransactionBuilder, TransactionBuilder};
 use alloy_rpc_types_eth::{
     simulate::{SimBlock, SimCallResult, SimulateError, SimulatedBlock},
     state::StateOverride,
-    BlockId, BlockOverrides, BlockTransactionsKind,
+    BlockOverrides, BlockTransactionsKind,
 };
-use jsonrpsee_types::{error::INTERNAL_ERROR_CODE, ErrorObject};
+use jsonrpsee_types::ErrorObject;
 use reth_evm::{
     execute::{BlockBuilder, BlockBuilderOutcome, BlockExecutor},
     Evm, HaltReasonFor,
@@ -60,12 +60,6 @@ pub enum EthSimulateError {
     /// Max gas limit for entire operation exceeded.
     #[error("Client adjustable limit reached")]
     GasLimitReached,
-    /// Base block for the simulation was not found.
-    #[error("block not found: {block}")]
-    BlockNotFound {
-        /// The block id that was requested.
-        block: BlockId,
-    },
     /// Block number in sequence did not increase.
     #[error("block numbers must be in order: {got} <= {parent}")]
     BlockNumberInvalid {
@@ -93,9 +87,6 @@ pub enum EthSimulateError {
     /// Transaction nonce is too high.
     #[error("nonce too high")]
     NonceTooHigh,
-    /// Transaction nonce cannot be incremented.
-    #[error("nonce has max value")]
-    NonceMaxValue,
     /// Transaction's baseFeePerGas is too low.
     #[error("max fee per gas less than block base fee")]
     BaseFeePerGasTooLow,
@@ -130,7 +121,6 @@ impl EthSimulateError {
         match self {
             Self::NonceTooLow { .. } => -38010,
             Self::NonceTooHigh => -38011,
-            Self::NonceMaxValue => INTERNAL_ERROR_CODE,
             Self::BaseFeePerGasTooLow => -38012,
             Self::IntrinsicGasTooLow => -38013,
             Self::InsufficientFunds { .. } => -38014,
@@ -141,7 +131,7 @@ impl EthSimulateError {
             Self::MaxInitCodeSizeExceeded => -38025,
             Self::TooManyBlocks | Self::GasLimitReached => -38026,
             Self::MovePrecompileToSelf(_) => -38022,
-            Self::BlockNotFound { .. } | Self::NotAPrecompile(_) => -32000,
+            Self::NotAPrecompile(_) => -32000,
         }
     }
 }
@@ -216,13 +206,7 @@ where
         if gap > 1 {
             for i in 1..gap {
                 let filler_number = prev_number + i;
-                let filler_time =
-                    prev_timestamp.checked_add(timestamp_increment).ok_or_else(|| {
-                        EthApiError::other(EthSimulateError::BlockTimestampInvalid {
-                            got: prev_timestamp,
-                            parent: prev_timestamp,
-                        })
-                    })?;
+                let filler_time = prev_timestamp + timestamp_increment;
                 out.push(SimBlock {
                     block_overrides: Some(BlockOverrides {
                         number: Some(U256::from(filler_number)),
@@ -247,12 +231,7 @@ where
             }
             t
         } else {
-            let t = prev_timestamp.checked_add(timestamp_increment).ok_or_else(|| {
-                EthApiError::other(EthSimulateError::BlockTimestampInvalid {
-                    got: prev_timestamp,
-                    parent: prev_timestamp,
-                })
-            })?;
+            let t = prev_timestamp + timestamp_increment;
             overrides.time = Some(t);
             t
         };
@@ -381,7 +360,6 @@ where
             default_gas_limit,
             builder.evm().block().basefee(),
             chain_id,
-            builder.evm().cfg_env().disable_nonce_check,
             builder.evm_mut().db_mut(),
             converter,
         )?;
@@ -428,7 +406,6 @@ pub fn resolve_transaction<DB: Database, Tx, T>(
     default_gas_limit: u64,
     block_base_fee_per_gas: u64,
     chain_id: u64,
-    disable_nonce_check: bool,
     db: &mut DB,
     converter: &T,
 ) -> Result<Recovered<Tx>, EthApiError>
@@ -451,10 +428,6 @@ where
         tx.as_mut().set_nonce(
             db.basic(from).map_err(Into::into)?.map(|acc| acc.nonce).unwrap_or_default(),
         );
-    }
-    // eth_simulateV1 validation-off mode behaves like eth_call; avoid revm's max-nonce guard.
-    if disable_nonce_check && tx.as_ref().nonce() == Some(u64::MAX) {
-        tx.as_mut().set_nonce(0);
     }
 
     if tx.as_ref().gas_limit().is_none() {
@@ -585,10 +558,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        apply_precompile_overrides, sanitize_chain, EthSimulateError, INTERNAL_ERROR_CODE,
-    };
-    use crate::{error::ToRpcError, EthApiError};
+    use super::{apply_precompile_overrides, sanitize_chain, EthSimulateError};
+    use crate::EthApiError;
     use alloy_chains::Chain;
     use alloy_consensus::Header;
     use alloy_evm::precompiles::PrecompilesMap;
@@ -600,22 +571,6 @@ mod tests {
     };
     use reth_primitives_traits::SealedHeader;
     use revm::precompile::Precompiles;
-
-    #[test]
-    fn nonce_max_value_error_uses_internal_error_code() {
-        let err = EthSimulateError::NonceMaxValue.to_rpc_error();
-
-        assert_eq!(err.code(), INTERNAL_ERROR_CODE);
-        assert_eq!(err.message(), "nonce has max value");
-    }
-
-    #[test]
-    fn block_not_found_error_uses_simulate_code() {
-        let err = EthSimulateError::BlockNotFound { block: 100000.into() }.to_rpc_error();
-
-        assert_eq!(err.code(), -32000);
-        assert_eq!(err.message(), "block not found: 0x186a0");
-    }
 
     fn parent_at(number: u64, timestamp: u64) -> SealedHeader<Header> {
         SealedHeader::seal_slow(Header { number, timestamp, ..Default::default() })
@@ -763,46 +718,6 @@ mod tests {
         let parent = parent_at(10, 100);
         let err = sanitize_chain(vec![block_with_number(10)], &parent, Chain::mainnet().id(), 256)
             .unwrap_err();
-        assert!(matches!(err, EthApiError::Other(_)));
-    }
-
-    #[test]
-    fn sanitize_chain_rejects_timestamp_overflow() {
-        // A block may set any timestamp above its parent's, including `u64::MAX`. The following
-        // block then defaults to `prev + increment`, which must not wrap.
-        let parent = parent_at(0, 0);
-        let blocks: Vec<SimBlock<TransactionRequest>> = vec![
-            SimBlock {
-                block_overrides: Some(BlockOverrides {
-                    time: Some(u64::MAX),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            SimBlock::default(),
-        ];
-
-        let err = sanitize_chain(blocks, &parent, Chain::mainnet().id(), 256).unwrap_err();
-        assert!(matches!(err, EthApiError::Other(_)));
-    }
-
-    #[test]
-    fn sanitize_chain_rejects_filler_timestamp_overflow() {
-        // Same, but the wrap would happen while generating filler blocks for a number gap.
-        let parent = parent_at(0, 0);
-        let blocks = vec![
-            SimBlock {
-                block_overrides: Some(BlockOverrides {
-                    number: Some(U256::from(1)),
-                    time: Some(u64::MAX),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            block_with_number(4),
-        ];
-
-        let err = sanitize_chain(blocks, &parent, Chain::mainnet().id(), 256).unwrap_err();
         assert!(matches!(err, EthApiError::Other(_)));
     }
 

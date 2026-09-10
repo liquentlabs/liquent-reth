@@ -4,13 +4,15 @@ pub use reth_primitives_traits::header::HeaderMut;
 
 use alloy_primitives::B256;
 use clap::Parser;
+use liquent_primitives::get_liquent_config;
 use reth_chainspec::EthChainSpec;
 use reth_cli::chainspec::ChainSpecParser;
 use reth_config::{config::EtlConfig, Config};
 use reth_consensus::noop::NoopConsensus;
 use reth_db::{init_db, open_db_read_only, DatabaseEnv};
-use reth_db_common::init::init_genesis_with_settings;
+use reth_db_common::init::init_genesis;
 use reth_downloaders::{bodies::noop::NoopBodiesDownloader, headers::noop::NoopHeaderDownloader};
+use reth_engine_tree::recovery::StorageRecoveryHelper;
 use reth_eth_wire::NetPrimitivesFor;
 use reth_evm::{noop::NoopEvmConfig, ConfigureEvm};
 use reth_network::NetworkEventListenerProvider;
@@ -19,22 +21,18 @@ use reth_node_builder::{
     Node, NodeComponents, NodeComponentsBuilder, NodeTypes, NodeTypesWithDBAdapter,
 };
 use reth_node_core::{
-    args::{DatabaseArgs, DatadirArgs, StaticFilesArgs, StorageArgs},
+    args::{DatabaseArgs, DatadirArgs},
     dirs::{ChainPath, DataDirPath},
 };
 use reth_provider::{
-    providers::{
-        BlockchainProvider, NodeTypesForProvider, RocksDBProvider, StaticFileProvider,
-        StaticFileProviderBuilder,
-    },
-    BalConfig, BalStoreHandle, InMemoryBalStore, ProviderFactory, StaticFileProviderFactory,
-    StorageSettings,
+    providers::{BlockchainProvider, NodeTypesForProvider, StaticFileProvider},
+    ProviderFactory, StageCheckpointReader, StaticFileProviderFactory,
 };
-use reth_stages::{sets::DefaultStages, Pipeline, PipelineTarget};
+use reth_stages::{sets::DefaultStages, Pipeline, PipelineTarget, StageId};
 use reth_static_file::StaticFileProducer;
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 /// Struct to hold config and datadir paths
 #[derive(Debug, Parser)]
@@ -63,38 +61,18 @@ pub struct EnvironmentArgs<C: ChainSpecParser> {
     /// All database related arguments
     #[command(flatten)]
     pub db: DatabaseArgs,
-
-    /// All static files related arguments
-    #[command(flatten)]
-    pub static_files: StaticFilesArgs,
-
-    /// Storage mode configuration (v2 vs v1/legacy)
-    #[command(flatten)]
-    pub storage: StorageArgs,
 }
 
 impl<C: ChainSpecParser> EnvironmentArgs<C> {
-    /// Returns the storage settings for new database initialization.
-    ///
-    /// Determined by the `--storage.v2` flag (defaults to `true`).
-    /// Existing databases retain whatever settings are persisted in their
-    /// metadata (checked during genesis init).
-    pub fn storage_settings(&self) -> StorageSettings {
-        if self.storage.v2 {
-            StorageSettings::v2()
-        } else {
-            StorageSettings::v1()
-        }
-    }
-
     /// Initializes environment according to [`AccessRights`] and returns an instance of
     /// [`Environment`].
     ///
-    /// The provided `runtime` is used for parallel storage I/O.
+    /// The provided `_runtime` is accepted for signature compatibility with upstream
+    /// callers; liquent's provider factory does not need it.
     pub fn init<N: CliNodeTypes>(
         &self,
         access: AccessRights,
-        runtime: reth_tasks::Runtime,
+        _runtime: reth_tasks::Runtime,
     ) -> eyre::Result<Environment<N>>
     where
         C: ChainSpecParser<ChainSpec = N::ChainSpec>,
@@ -102,12 +80,10 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
         let data_dir = self.datadir.clone().resolve_datadir(self.chain.chain());
         let db_path = data_dir.db();
         let sf_path = data_dir.static_files();
-        let rocksdb_path = data_dir.rocksdb();
 
         if access.is_read_write() {
             reth_fs_util::create_dir_all(&db_path)?;
             reth_fs_util::create_dir_all(&sf_path)?;
-            reth_fs_util::create_dir_all(&rocksdb_path)?;
         }
 
         let config_path = self.config.clone().unwrap_or_else(|| data_dir.config());
@@ -127,97 +103,69 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
         }
 
         info!(target: "reth::cli", ?db_path, ?sf_path, "Opening storage");
-        let genesis_block_number = self.chain.genesis().number.unwrap_or_default();
         let (db, sfp) = match access {
-            AccessRights::RW | AccessRights::RwInconsistent => (
-                init_db(db_path, self.db.database_args())?,
-                StaticFileProviderBuilder::read_write(sf_path)
-                    .with_metrics()
-                    .with_genesis_block_number(genesis_block_number)
-                    .build()?,
+            AccessRights::RW => (
+                Arc::new(init_db(db_path, self.db.database_args())?),
+                StaticFileProvider::read_write(sf_path)?,
             ),
             AccessRights::RO | AccessRights::RoInconsistent => (
-                open_db_read_only(&db_path, self.db.database_args())?,
-                StaticFileProviderBuilder::read_only(sf_path)
-                    .with_metrics()
-                    .with_genesis_block_number(genesis_block_number)
-                    .build()?,
+                Arc::new(open_db_read_only(&db_path, self.db.database_args())?),
+                StaticFileProvider::read_only(sf_path, false)?,
             ),
         };
-        let rocksdb_provider = if !access.is_read_write() && !RocksDBProvider::exists(&rocksdb_path)
-        {
-            // RocksDB database doesn't exist yet (e.g. datadir restored from a snapshot
-            // or created before RocksDB storage). Create an empty one so read-only
-            // commands can proceed.
-            debug!(target: "reth::cli", ?rocksdb_path, "RocksDB not found, initializing empty database");
-            reth_fs_util::create_dir_all(&rocksdb_path)?;
-            let mut builder = RocksDBProvider::builder(data_dir.rocksdb())
-                .with_default_tables()
-                .with_database_log_level(self.db.log_level);
-            if let Some(cache_size) = self.db.rocksdb_block_cache_size {
-                builder = builder.with_block_cache_size(cache_size);
-            }
-            builder.build()?
-        } else {
-            let mut builder = RocksDBProvider::builder(data_dir.rocksdb())
-                .with_default_tables()
-                .with_database_log_level(self.db.log_level)
-                .with_read_only(!access.is_read_write());
-            if let Some(cache_size) = self.db.rocksdb_block_cache_size {
-                builder = builder.with_block_cache_size(cache_size);
-            }
-            builder.build()?
-        };
 
-        let provider_factory =
-            self.create_provider_factory(&config, db, sfp, rocksdb_provider, access, runtime)?;
+        let provider_factory = self.create_provider_factory(&config, db, sfp, access)?;
         if access.is_read_write() {
-            debug!(target: "reth::cli", chain=%self.chain.chain(), genesis=?self.chain.genesis_hash(), "Initializing genesis");
-            init_genesis_with_settings(&provider_factory, self.storage_settings())?;
+            // Skip init_genesis if the database already has an Execution checkpoint > 0,
+            // indicating it has been used. In pipe execution mode, genesis headers
+            // may not be in static files or CanonicalHeaders, causing init_genesis
+            // to incorrectly re-initialize and reset all stage checkpoints to 0.
+            let should_init = provider_factory
+                .get_stage_checkpoint(StageId::Execution)
+                .ok()
+                .flatten()
+                .is_none_or(|ck| ck.block_number == 0);
+            if should_init {
+                info!(target: "reth::cli", chain=%self.chain.chain(), genesis=?self.chain.genesis_hash(), "Initializing genesis");
+                init_genesis(&provider_factory)?;
+            }
         }
 
         Ok(Environment { config, provider_factory, data_dir })
     }
 
-    /// Returns a [`ProviderFactory`] after executing consistency checks unless `access` permits
-    /// inconsistent storage.
+    /// Returns a [`ProviderFactory`] after executing consistency checks.
     ///
-    /// Checked read-write access heals inconsistencies (including a pipeline unwind), while checked
-    /// read-only access warns that the node must be restarted to heal.
+    /// If it's a read-write environment and an issue is found, it will attempt to heal (including a
+    /// pipeline unwind). Otherwise, it will print out a warning, advising the user to restart the
+    /// node to heal.
     fn create_provider_factory<N: CliNodeTypes>(
         &self,
         config: &Config,
-        db: DatabaseEnv,
+        db: Arc<DatabaseEnv>,
         static_file_provider: StaticFileProvider<N::Primitives>,
-        rocksdb_provider: RocksDBProvider,
         access: AccessRights,
-        runtime: reth_tasks::Runtime,
-    ) -> eyre::Result<ProviderFactory<NodeTypesWithDBAdapter<N, DatabaseEnv>>>
+    ) -> eyre::Result<ProviderFactory<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>>>
     where
         C: ChainSpecParser<ChainSpec = N::ChainSpec>,
     {
-        let balstore_cache_size =
-            self.db.balstore_cache_size.unwrap_or(BalConfig::DEFAULT_IN_MEMORY_RETENTION_DISTANCE);
-        let bal_store = BalStoreHandle::new(InMemoryBalStore::new(
-            BalConfig::with_in_memory_retention_distance(balstore_cache_size),
-        ));
-        let factory = ProviderFactory::<NodeTypesWithDBAdapter<N, DatabaseEnv>>::new(
+        let has_receipt_pruning = config.prune.has_receipts_pruning();
+        let prune_modes = config.prune.segments.clone();
+        let factory = ProviderFactory::<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>>::new(
             db,
             self.chain.clone(),
             static_file_provider,
-            rocksdb_provider,
-            runtime,
-        )?
-        .with_prune_modes(config.prune.segments.clone())
-        .with_minimum_pruning_distance(config.prune.minimum_pruning_distance)
-        .with_bal_store(bal_store);
+        )
+        .with_prune_modes(prune_modes.clone());
 
         // Check for consistency between database and static files.
-        if !access.skips_consistency_check() &&
-            let Some(unwind_target) =
-                factory.static_file_provider().check_consistency(&factory.provider()?)?
+        if !access.is_read_only_inconsistent() &&
+            let Some(unwind_target) = factory
+                .static_file_provider()
+                .check_consistency(&factory.provider()?, has_receipt_pruning)?
         {
-            if factory.db_ref().is_read_only()? {
+            // Check if database is read-only to avoid destructive operations
+            if factory.db_ref().is_read_only() {
                 warn!(target: "reth::cli", ?unwind_target, "Inconsistent storage. Restart node to heal.");
                 return Ok(factory)
             }
@@ -235,7 +183,7 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
             let (_tip_tx, tip_rx) = watch::channel(B256::ZERO);
 
             // Builds and executes an unwind-only pipeline
-            let mut pipeline = Pipeline::<NodeTypesWithDBAdapter<N, DatabaseEnv>>::builder()
+            let mut pipeline = Pipeline::<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>>::builder()
                 .add_stages(DefaultStages::new(
                     factory.clone(),
                     tip_rx,
@@ -244,17 +192,21 @@ impl<C: ChainSpecParser> EnvironmentArgs<C> {
                     NoopBodiesDownloader::default(),
                     NoopEvmConfig::<N::Evm>::default(),
                     config.stages.clone(),
-                    config.prune.segments.clone(),
+                    prune_modes.clone(),
                     None,
                 ))
-                .build(
-                    factory.clone(),
-                    StaticFileProducer::new(factory.clone(), config.prune.segments.clone()),
-                );
+                .build(factory.clone(), StaticFileProducer::new(factory.clone(), prune_modes));
 
             // Move all applicable data from database to static files.
             pipeline.move_to_static_files()?;
             pipeline.unwind(unwind_target.unwind_target().expect("should exist"), None)?;
+        }
+
+        // In pipe execution mode (disable_pipe_execution = false), we need to recover
+        // any interrupted block writes from checkpoints
+        if !get_liquent_config().disable_pipe_execution {
+            info!(target: "reth::cli", "Checking for interrupted block writes and recovering if needed");
+            StorageRecoveryHelper::new(&factory).check_and_recover()?;
         }
 
         Ok(factory)
@@ -267,7 +219,7 @@ pub struct Environment<N: NodeTypes> {
     /// Configuration for reth node
     pub config: Config,
     /// Provider factory.
-    pub provider_factory: ProviderFactory<NodeTypesWithDBAdapter<N, DatabaseEnv>>,
+    pub provider_factory: ProviderFactory<NodeTypesWithDBAdapter<N, Arc<DatabaseEnv>>>,
     /// Datadir path.
     pub data_dir: ChainPath<DataDirPath>,
 }
@@ -277,8 +229,6 @@ pub struct Environment<N: NodeTypes> {
 pub enum AccessRights {
     /// Read-write access
     RW,
-    /// Read-write access with possibly inconsistent data
-    RwInconsistent,
     /// Read-only access
     RO,
     /// Read-only access with possibly inconsistent data
@@ -288,7 +238,7 @@ pub enum AccessRights {
 impl AccessRights {
     /// Returns `true` if it requires read-write access to the environment.
     pub const fn is_read_write(&self) -> bool {
-        matches!(self, Self::RW | Self::RwInconsistent)
+        matches!(self, Self::RW)
     }
 
     /// Returns `true` if it requires read-only access to the environment with possibly inconsistent
@@ -296,19 +246,25 @@ impl AccessRights {
     pub const fn is_read_only_inconsistent(&self) -> bool {
         matches!(self, Self::RoInconsistent)
     }
-
-    /// Returns `true` if storage consistency checks should be skipped.
-    pub const fn skips_consistency_check(&self) -> bool {
-        matches!(self, Self::RwInconsistent | Self::RoInconsistent)
-    }
 }
 
 /// Helper alias to satisfy `FullNodeTypes` bound on [`Node`] trait generic.
 type FullTypesAdapter<T> = FullNodeTypesAdapter<
     T,
-    DatabaseEnv,
-    BlockchainProvider<NodeTypesWithDBAdapter<T, DatabaseEnv>>,
+    Arc<DatabaseEnv>,
+    BlockchainProvider<NodeTypesWithDBAdapter<T, Arc<DatabaseEnv>>>,
 >;
+
+/// Trait for block headers that can be modified through CLI operations.
+pub trait CliHeader {
+    fn set_number(&mut self, number: u64);
+}
+
+impl CliHeader for alloy_consensus::Header {
+    fn set_number(&mut self, number: u64) {
+        self.number = number;
+    }
+}
 
 /// Helper trait with a common set of requirements for the
 /// [`NodeTypes`] in CLI.
@@ -365,21 +321,4 @@ where
     Comp: CliNodeComponents<N>,
 {
     type Components = Comp;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::AccessRights;
-
-    #[test]
-    fn inconsistent_access_rights_skip_consistency_checks() {
-        assert!(AccessRights::RwInconsistent.is_read_write());
-        assert!(AccessRights::RwInconsistent.skips_consistency_check());
-        assert!(!AccessRights::RW.skips_consistency_check());
-
-        assert!(!AccessRights::RoInconsistent.is_read_write());
-        assert!(AccessRights::RoInconsistent.is_read_only_inconsistent());
-        assert!(AccessRights::RoInconsistent.skips_consistency_check());
-        assert!(!AccessRights::RO.skips_consistency_check());
-    }
 }

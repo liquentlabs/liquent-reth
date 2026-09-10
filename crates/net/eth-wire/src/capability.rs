@@ -176,13 +176,6 @@ impl SharedCapabilities {
             .ok_or(P2PStreamError::CapabilityNotShared)
     }
 
-    /// Returns `true` if the shared capabilities are exactly `eth` and `snap/2` (EIP-8189), the
-    /// layout handled by the dedicated [`EthSnapStream`](crate::EthSnapStream).
-    #[inline]
-    pub fn is_exact_eth_snap_v2(&self) -> bool {
-        self.len() == 2 && self.ensure_matching_capability(&Capability::snap_2()).is_ok()
-    }
-
     /// Returns true if the shared capabilities contain the given capability.
     #[inline]
     pub fn contains(&self, cap: &Capability) -> bool {
@@ -259,8 +252,7 @@ impl SharedCapabilities {
             cap = next
         }
 
-        let end = u16::from(cap.message_id_offset()) + u16::from(cap.num_messages());
-        (u16::from(offset) < end).then_some(cap)
+        Some(cap)
     }
 
     /// Returns the shared capability for the given capability or an error if it's not compatible.
@@ -468,18 +460,6 @@ mod tests {
     }
 
     #[test]
-    fn lookup_rejects_message_ids_past_last_capability() {
-        let cap = Capability::new_static("test", 1);
-        let shared =
-            SharedCapabilities::try_new(vec![Protocol::new(cap.clone(), 1)], vec![cap.clone()])
-                .unwrap();
-        let offset = shared.find(&cap).unwrap().message_id_offset();
-
-        assert_eq!(shared.find_by_offset(offset).unwrap().capability().as_ref(), &cap);
-        assert!(shared.find_by_offset(offset + 1).is_none());
-    }
-
-    #[test]
     fn test_peer_capability_version_zero() {
         let cap = Capability::new_static("TestName", 0);
         let local_capabilities: Vec<Protocol> =
@@ -582,10 +562,10 @@ mod tests {
     fn relative_message_id_accounts_for_intermediate_capabilities() {
         let intermediate_cap = Capability::new_static("foo", 1);
         let intermediate = Protocol::new(intermediate_cap.clone(), 3);
-        let snap = Capability::snap(SnapVersion::V2);
+        let snap = Capability::snap(SnapVersion::V1);
         let eth = Capability::eth(EthVersion::Eth69);
         let local_capabilities =
-            vec![EthVersion::Eth69.into(), intermediate, Protocol::snap(SnapVersion::V2)];
+            vec![EthVersion::Eth69.into(), intermediate, Protocol::snap(SnapVersion::V1)];
         let peer_capabilities = vec![eth, intermediate_cap, snap.clone()];
 
         let shared = SharedCapabilities::try_new(local_capabilities, peer_capabilities).unwrap();
@@ -599,9 +579,9 @@ mod tests {
     fn capability_message_id_rejects_other_capability_range() {
         let intermediate_cap = Capability::new_static("foo", 1);
         let intermediate = Protocol::new(intermediate_cap.clone(), 3);
-        let snap = Capability::snap(SnapVersion::V2);
+        let snap = Capability::snap(SnapVersion::V1);
         let local_capabilities =
-            vec![EthVersion::Eth69.into(), intermediate, Protocol::snap(SnapVersion::V2)];
+            vec![EthVersion::Eth69.into(), intermediate, Protocol::snap(SnapVersion::V1)];
         let peer_capabilities =
             vec![Capability::eth(EthVersion::Eth69), intermediate_cap.clone(), snap.clone()];
 
@@ -609,7 +589,7 @@ mod tests {
         let intermediate_id = shared.relative_message_id(&intermediate_cap, 1).unwrap();
 
         assert_eq!(shared.capability_message_id(&snap, intermediate_id), None);
-        assert_eq!(shared.relative_message_id(&snap, SnapVersion::V2.message_count()), None);
+        assert_eq!(shared.relative_message_id(&snap, SnapVersion::V1.message_count()), None);
     }
 
     #[test]
@@ -625,49 +605,5 @@ mod tests {
 
         // Verify that the decoded message matches the original
         assert_eq!(msg, decoded);
-    }
-
-    #[test]
-    fn is_exact_eth_snap_v2_accepts_eth_and_snap() {
-        let shared = SharedCapabilities::try_new(
-            vec![EthVersion::Eth68.into(), Protocol::snap_2()],
-            vec![EthVersion::Eth68.into(), Capability::snap_2()],
-        )
-        .unwrap();
-        assert!(shared.is_exact_eth_snap_v2());
-    }
-
-    #[test]
-    fn is_exact_eth_snap_v2_rejects_eth_only() {
-        let shared = SharedCapabilities::try_new(
-            vec![EthVersion::Eth68.into()],
-            vec![EthVersion::Eth68.into()],
-        )
-        .unwrap();
-        assert!(!shared.is_exact_eth_snap_v2());
-    }
-
-    #[test]
-    fn is_exact_eth_snap_v2_rejects_eth_without_snap() {
-        // eth + a non-snap capability is not the dedicated layout.
-        let cap = Capability::new_static("les", 1);
-        let shared = SharedCapabilities::try_new(
-            vec![EthVersion::Eth68.into(), Protocol::new(cap.clone(), 5)],
-            vec![EthVersion::Eth68.into(), cap],
-        )
-        .unwrap();
-        assert!(!shared.is_exact_eth_snap_v2());
-    }
-
-    #[test]
-    fn is_exact_eth_snap_v2_rejects_eth_snap_plus_extra() {
-        // eth + snap/2 + another capability belongs on the general satellite multiplexer.
-        let cap = Capability::new_static("les", 1);
-        let shared = SharedCapabilities::try_new(
-            vec![EthVersion::Eth68.into(), Protocol::snap_2(), Protocol::new(cap.clone(), 5)],
-            vec![EthVersion::Eth68.into(), Capability::snap_2(), cap],
-        )
-        .unwrap();
-        assert!(!shared.is_exact_eth_snap_v2());
     }
 }

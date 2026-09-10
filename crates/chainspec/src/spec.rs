@@ -4,6 +4,7 @@ use alloy_evm::eth::spec::EthExecutorSpec;
 use crate::{
     constants::{MAINNET_DEPOSIT_CONTRACT, MAINNET_PRUNE_DELETE_LIMIT},
     ethereum::SEPOLIA_PARIS_TTD,
+    liquent::LiquentHardfork,
     holesky, hoodi, mainnet,
     mainnet::{MAINNET_PARIS_BLOCK, MAINNET_PARIS_TTD},
     sepolia,
@@ -82,11 +83,11 @@ pub fn make_genesis_header(genesis: &Genesis, hardforks: &ChainHardforks) -> Hea
         .active_at_timestamp(genesis.timestamp)
         .then_some(EMPTY_BLOCK_ACCESS_LIST_HASH);
 
-    // If Amsterdam is activated at genesis we set slot number to the provided genesis or 0
+    // If Amsterdam is activated at genesis we set slot number to 0
     let slot_number = hardforks
         .fork(EthereumHardfork::Amsterdam)
         .active_at_timestamp(genesis.timestamp)
-        .then_some(genesis.slot_number.unwrap_or(0));
+        .then_some(0);
 
     Header {
         number: genesis.number.unwrap_or_default(),
@@ -137,6 +138,9 @@ pub static MAINNET: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
             (mainnet::MAINNET_BPO1_TIMESTAMP, BlobParams::bpo1()),
             (mainnet::MAINNET_BPO2_TIMESTAMP, BlobParams::bpo2()),
         ]),
+        liquent_hardforks: ChainHardforks::default(),
+        liquent_min_base_fee: None,
+        liquent_min_base_fee_activation_block: 0,
     };
     spec.genesis.config.dao_fork_support = true;
     spec.into()
@@ -172,6 +176,9 @@ pub static SEPOLIA: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
             (sepolia::SEPOLIA_BPO1_TIMESTAMP, BlobParams::bpo1()),
             (sepolia::SEPOLIA_BPO2_TIMESTAMP, BlobParams::bpo2()),
         ]),
+        liquent_hardforks: ChainHardforks::default(),
+        liquent_min_base_fee: None,
+        liquent_min_base_fee_activation_block: 0,
     };
     spec.genesis.config.dao_fork_support = true;
     spec.into()
@@ -202,6 +209,9 @@ pub static HOLESKY: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
             (holesky::HOLESKY_BPO1_TIMESTAMP, BlobParams::bpo1()),
             (holesky::HOLESKY_BPO2_TIMESTAMP, BlobParams::bpo2()),
         ]),
+        liquent_hardforks: ChainHardforks::default(),
+        liquent_min_base_fee: None,
+        liquent_min_base_fee_activation_block: 0,
     };
     spec.genesis.config.dao_fork_support = true;
     spec.into()
@@ -234,6 +244,9 @@ pub static HOODI: LazyLock<Arc<ChainSpec>> = LazyLock::new(|| {
             (hoodi::HOODI_BPO1_TIMESTAMP, BlobParams::bpo1()),
             (hoodi::HOODI_BPO2_TIMESTAMP, BlobParams::bpo2()),
         ]),
+        liquent_hardforks: ChainHardforks::default(),
+        liquent_min_base_fee: None,
+        liquent_min_base_fee_activation_block: 0,
     };
     spec.genesis.config.dao_fork_support = true;
     spec.into()
@@ -312,7 +325,6 @@ pub fn create_chain_config(
         prague_time: timestamp(EthereumHardfork::Prague),
         osaka_time: timestamp(EthereumHardfork::Osaka),
         amsterdam_time: timestamp(EthereumHardfork::Amsterdam),
-        bogota_time: timestamp(EthereumHardfork::Bogota),
         bpo1_time: timestamp(EthereumHardfork::Bpo1),
         bpo2_time: timestamp(EthereumHardfork::Bpo2),
         bpo3_time: timestamp(EthereumHardfork::Bpo3),
@@ -442,6 +454,27 @@ pub struct ChainSpec<H: BlockHeader = Header> {
 
     /// The settings passed for blob configurations for specific hardforks.
     pub blob_params: BlobScheduleBlobParams,
+
+    /// Liquent-specific hardforks and their activation conditions.
+    pub liquent_hardforks: ChainHardforks,
+
+    /// Liquent protocol minimum base fee floor (in wei) applicable to the **latest**
+    /// segment of this branch's fee schedule. When `Some`, the chainspec is treated as
+    /// Liquent and the floor schedule encoded in
+    /// [`EthChainSpec::liquent_min_base_fee_at_block`] applies. When `None`, no floor is
+    /// applied (upstream EIP-1559 behavior, used by Ethereum mainnet history sync).
+    /// Parsed from genesis JSON `config.liquentMinBaseFee`.
+    pub liquent_min_base_fee: Option<u64>,
+
+    /// Block number at which [`Self::liquent_min_base_fee`] activates on this branch.
+    /// On main this is hardcoded to `0` in `From<Genesis>` (floor enforced from
+    /// genesis). Released testnet branches read it from genesis JSON
+    /// `config.extra_fields` (the same mechanism used by Alpha/Beta timestamp
+    /// hardforks), so the rolling-upgrade activation height can be set per-network
+    /// without code changes. Historical-segment values from prior schedule steps
+    /// still live in branch-specific code, ensuring nodes restarted across multiple
+    /// hardforks validate older blocks correctly from the binary's full schedule.
+    pub liquent_min_base_fee_activation_block: u64,
 }
 
 impl<H: BlockHeader> Default for ChainSpec<H> {
@@ -456,6 +489,9 @@ impl<H: BlockHeader> Default for ChainSpec<H> {
             base_fee_params: BaseFeeParamsKind::Constant(BaseFeeParams::ethereum()),
             prune_delete_limit: MAINNET_PRUNE_DELETE_LIMIT,
             blob_params: Default::default(),
+            liquent_hardforks: Default::default(),
+            liquent_min_base_fee: None,
+            liquent_min_base_fee_activation_block: 0,
         }
     }
 }
@@ -804,6 +840,9 @@ impl<H: BlockHeader> ChainSpec<H> {
             base_fee_params,
             prune_delete_limit,
             blob_params,
+            liquent_hardforks,
+            liquent_min_base_fee,
+            liquent_min_base_fee_activation_block,
         } = self;
         ChainSpec {
             chain,
@@ -815,6 +854,9 @@ impl<H: BlockHeader> ChainSpec<H> {
             base_fee_params,
             prune_delete_limit,
             blob_params,
+            liquent_hardforks,
+            liquent_min_base_fee,
+            liquent_min_base_fee_activation_block,
         }
     }
 }
@@ -897,7 +939,6 @@ impl From<Genesis> for ChainSpec {
             (EthereumHardfork::Bpo4.boxed(), genesis.config.bpo4_time),
             (EthereumHardfork::Bpo5.boxed(), genesis.config.bpo5_time),
             (EthereumHardfork::Amsterdam.boxed(), genesis.config.amsterdam_time),
-            (EthereumHardfork::Bogota.boxed(), genesis.config.bogota_time),
         ];
 
         let mut time_hardforks = time_hardfork_opts
@@ -936,6 +977,56 @@ impl From<Genesis> for ChainSpec {
 
         let hardforks = ChainHardforks::new(ordered_hardforks);
 
+        // Liquent-specific hardforks from genesis extra_fields.
+        // Fail-closed: missing / misspelled keys (e.g. legacy `betaBlock`) mean the
+        // fork is never scheduled.
+        let mut liquent_hardforks = Vec::new();
+        if let Some(gamma_time) =
+            genesis.config.extra_fields.get("gammaTime").and_then(|v| v.as_u64())
+        {
+            liquent_hardforks
+                .push((LiquentHardfork::Gamma.boxed(), ForkCondition::Timestamp(gamma_time)));
+        }
+        if let Some(alpha_time) =
+            genesis.config.extra_fields.get("alphaTime").and_then(|v| v.as_u64())
+        {
+            liquent_hardforks
+                .push((LiquentHardfork::Alpha.boxed(), ForkCondition::Timestamp(alpha_time)));
+        }
+        if let Some(beta_time) =
+            genesis.config.extra_fields.get("betaTime").and_then(|v| v.as_u64())
+        {
+            liquent_hardforks
+                .push((LiquentHardfork::Beta.boxed(), ForkCondition::Timestamp(beta_time)));
+        }
+        if let Some(testnet_owner_fix_time) =
+            genesis.config.extra_fields.get("testnetOwnerFixTime").and_then(|v| v.as_u64())
+        {
+            liquent_hardforks.push((
+                LiquentHardfork::TestnetOwnerFix.boxed(),
+                ForkCondition::Timestamp(testnet_owner_fix_time),
+            ));
+        }
+        if let Some(testnet_owner_fix_v2_time) =
+            genesis.config.extra_fields.get("testnetOwnerFixV2Time").and_then(|v| v.as_u64())
+        {
+            liquent_hardforks.push((
+                LiquentHardfork::TestnetOwnerFixV2.boxed(),
+                ForkCondition::Timestamp(testnet_owner_fix_v2_time),
+            ));
+        }
+        let liquent_hardforks = ChainHardforks::new(liquent_hardforks);
+
+        // This is intentionally optional: Liquent chains enable the fee floor through genesis,
+        // while its absence preserves upstream EIP-1559 semantics for Reth tests and history sync.
+        let liquent_min_base_fee =
+            genesis.config.extra_fields.get("liquentMinBaseFee").and_then(|v| v.as_u64());
+        // main: floor activates at genesis (block 0). Released testnet branches override
+        // this to read the rolling-upgrade activation height from genesis, keeping the
+        // value configurable per-network without code changes — same mechanism as
+        // Alpha/Beta timestamp hardforks above.
+        let liquent_min_base_fee_activation_block = 0u64;
+
         Self {
             chain: genesis.config.chain_id.into(),
             genesis_header: SealedHeader::new_unhashed(make_genesis_header(&genesis, &hardforks)),
@@ -944,6 +1035,9 @@ impl From<Genesis> for ChainSpec {
             paris_block_and_final_difficulty,
             deposit_contract,
             blob_params,
+            liquent_hardforks,
+            liquent_min_base_fee,
+            liquent_min_base_fee_activation_block,
             ..Default::default()
         }
     }
@@ -1214,19 +1308,6 @@ impl ChainSpecBuilder {
     /// Enable Amsterdam at the given timestamp.
     pub fn with_amsterdam_at(mut self, timestamp: u64) -> Self {
         self.hardforks.insert(EthereumHardfork::Amsterdam, ForkCondition::Timestamp(timestamp));
-        self
-    }
-
-    /// Enable Bogota at genesis.
-    pub fn bogota_activated(mut self) -> Self {
-        self = self.amsterdam_activated();
-        self.hardforks.insert(EthereumHardfork::Bogota, ForkCondition::Timestamp(0));
-        self
-    }
-
-    /// Enable Bogota at the given timestamp.
-    pub fn with_bogota_at(mut self, timestamp: u64) -> Self {
-        self.hardforks.insert(EthereumHardfork::Bogota, ForkCondition::Timestamp(timestamp));
         self
     }
 
@@ -2580,6 +2661,109 @@ Post-merge hard forks (timestamp based):
     }
 
     #[test]
+    fn test_parse_gamma_time() {
+        let mut genesis = Genesis::default();
+        genesis.config.extra_fields.insert("gammaTime".to_string(), serde_json::json!(12_345));
+
+        let chainspec = ChainSpec::from(genesis);
+        assert_eq!(
+            chainspec.liquent_hardforks.fork(LiquentHardfork::Gamma),
+            ForkCondition::Timestamp(12_345)
+        );
+    }
+
+    #[test]
+    fn test_gamma_time_is_fail_closed() {
+        for (key, value) in [
+            ("oracleV1Block", serde_json::json!(12_345)),
+            ("gammaBlock", serde_json::json!(12_345)),
+            ("gammaTime", serde_json::json!("12345")),
+        ] {
+            let mut genesis = Genesis::default();
+            genesis.config.extra_fields.insert(key.to_string(), value);
+
+            let chainspec = ChainSpec::from(genesis);
+            assert_eq!(
+                chainspec.liquent_hardforks.fork(LiquentHardfork::Gamma),
+                ForkCondition::Never
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_testnet_owner_fix_time() {
+        let mut genesis = Genesis::default();
+        genesis
+            .config
+            .extra_fields
+            .insert("testnetOwnerFixTime".to_string(), serde_json::json!(99_001));
+
+        let chainspec = ChainSpec::from(genesis);
+        assert_eq!(
+            chainspec.liquent_hardforks.fork(LiquentHardfork::TestnetOwnerFix),
+            ForkCondition::Timestamp(99_001)
+        );
+    }
+
+    #[test]
+    fn test_parse_testnet_owner_fix_v2_time() {
+        let mut genesis = Genesis::default();
+        genesis
+            .config
+            .extra_fields
+            .insert("testnetOwnerFixV2Time".to_string(), serde_json::json!(99_002));
+
+        let chainspec = ChainSpec::from(genesis);
+        assert_eq!(
+            chainspec.liquent_hardforks.fork(LiquentHardfork::TestnetOwnerFixV2),
+            ForkCondition::Timestamp(99_002)
+        );
+        // Independent of v1: missing v1 key stays Never.
+        assert_eq!(
+            chainspec.liquent_hardforks.fork(LiquentHardfork::TestnetOwnerFix),
+            ForkCondition::Never
+        );
+    }
+
+    #[test]
+    fn test_testnet_owner_fix_time_is_fail_closed() {
+        for (key, value) in [
+            ("testnetOwnerFixBlock", serde_json::json!(99_001)),
+            ("testnetOwnerFixTime", serde_json::json!("99001")),
+            ("testnet_owner_fix_time", serde_json::json!(99_001)),
+        ] {
+            let mut genesis = Genesis::default();
+            genesis.config.extra_fields.insert(key.to_string(), value);
+
+            let chainspec = ChainSpec::from(genesis);
+            assert_eq!(
+                chainspec.liquent_hardforks.fork(LiquentHardfork::TestnetOwnerFix),
+                ForkCondition::Never
+            );
+        }
+    }
+
+    #[test]
+    fn test_testnet_owner_fix_v2_time_is_fail_closed() {
+        for (key, value) in [
+            ("testnetOwnerFixV2Block", serde_json::json!(99_002)),
+            ("testnetOwnerFixV2Time", serde_json::json!("99002")),
+            ("testnet_owner_fix_v2_time", serde_json::json!(99_002)),
+            // v1 key must not schedule v2
+            ("testnetOwnerFixTime", serde_json::json!(99_001)),
+        ] {
+            let mut genesis = Genesis::default();
+            genesis.config.extra_fields.insert(key.to_string(), value);
+
+            let chainspec = ChainSpec::from(genesis);
+            assert_eq!(
+                chainspec.liquent_hardforks.fork(LiquentHardfork::TestnetOwnerFixV2),
+                ForkCondition::Never
+            );
+        }
+    }
+
+    #[test]
     fn test_parse_cancun_genesis_json() {
         let s = r#"{"config":{"ethash":{},"chainId":1337,"homesteadBlock":0,"eip150Block":0,"eip155Block":0,"eip158Block":0,"byzantiumBlock":0,"constantinopleBlock":0,"petersburgBlock":0,"istanbulBlock":0,"berlinBlock":0,"londonBlock":0,"terminalTotalDifficulty":0,"terminalTotalDifficultyPassed":true,"shanghaiTime":0,"cancunTime":4661},"nonce":"0x0","timestamp":"0x0","extraData":"0x","gasLimit":"0x4c4b40","difficulty":"0x1","mixHash":"0x0000000000000000000000000000000000000000000000000000000000000000","coinbase":"0x0000000000000000000000000000000000000000","alloc":{"658bdf435d810c91414ec09147daa6db62406379":{"balance":"0x487a9a304539440000"},"aa00000000000000000000000000000000000000":{"code":"0x6042","storage":{"0x0000000000000000000000000000000000000000000000000000000000000000":"0x0000000000000000000000000000000000000000000000000000000000000000","0x0100000000000000000000000000000000000000000000000000000000000000":"0x0100000000000000000000000000000000000000000000000000000000000000","0x0200000000000000000000000000000000000000000000000000000000000000":"0x0200000000000000000000000000000000000000000000000000000000000000","0x0300000000000000000000000000000000000000000000000000000000000000":"0x0000000000000000000000000000000000000000000000000000000000000303"},"balance":"0x1","nonce":"0x1"},"bb00000000000000000000000000000000000000":{"code":"0x600154600354","storage":{"0x0000000000000000000000000000000000000000000000000000000000000000":"0x0000000000000000000000000000000000000000000000000000000000000000","0x0100000000000000000000000000000000000000000000000000000000000000":"0x0100000000000000000000000000000000000000000000000000000000000000","0x0200000000000000000000000000000000000000000000000000000000000000":"0x0200000000000000000000000000000000000000000000000000000000000000","0x0300000000000000000000000000000000000000000000000000000000000000":"0x0000000000000000000000000000000000000000000000000000000000000303"},"balance":"0x2","nonce":"0x1"}},"number":"0x0","gasUsed":"0x0","parentHash":"0x0000000000000000000000000000000000000000000000000000000000000000","baseFeePerGas":"0x3b9aca00"}"#;
         let genesis: Genesis = serde_json::from_str(s).unwrap();
@@ -2669,28 +2853,6 @@ Post-merge hard forks (timestamp based):
         // check that the forkhash is correct
         let expected_forkhash = ForkHash(hex!("0x8062457a"));
         assert_eq!(ForkHash::from(genesis_hash), expected_forkhash);
-    }
-
-    #[test]
-    fn test_amsterdam_genesis_slot_number() {
-        // a genesis-provided slot number is used as-is
-        let genesis =
-            Genesis { gas_limit: 0x2fefd8u64, ..Default::default() }.with_slot_number(Some(999));
-        let chainspec = ChainSpecBuilder::default()
-            .chain(Chain::from_id(1337))
-            .genesis(genesis)
-            .amsterdam_activated()
-            .build();
-        assert_eq!(chainspec.genesis_header().slot_number, Some(999));
-
-        // an omitted slot number defaults to 0
-        let genesis = Genesis { gas_limit: 0x2fefd8u64, ..Default::default() };
-        let chainspec = ChainSpecBuilder::default()
-            .chain(Chain::from_id(1337))
-            .genesis(genesis)
-            .amsterdam_activated()
-            .build();
-        assert_eq!(chainspec.genesis_header().slot_number, Some(0));
     }
 
     #[test]

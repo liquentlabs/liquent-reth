@@ -1,7 +1,7 @@
 use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_primitives::{Address, Bytes, B256, U256, U64};
 use alloy_rpc_types_eth::{
-    state::StateOverride, BlockOverrides, EIP1186AccountProofResponse, Filter, Index, SyncStatus,
+    state::StateOverride, BlockOverrides, EIP1186AccountProofResponse, Filter, Log, SyncStatus,
 };
 use alloy_serde::JsonStorageKey;
 use jsonrpsee::core::RpcResult as Result;
@@ -11,10 +11,8 @@ use reth_rpc_convert::RpcTxReq;
 /// Re-export for convenience
 pub use reth_rpc_engine_api::EngineApi;
 use reth_rpc_eth_api::{
-    EngineEthFilter, FullEthApiTypes, QueryLimits, RpcBlock, RpcHeader, RpcLog, RpcReceipt,
-    RpcTransaction,
+    EngineEthFilter, FullEthApiTypes, QueryLimits, RpcBlock, RpcHeader, RpcReceipt, RpcTransaction,
 };
-use serde_json::Value;
 use tracing_futures::Instrument;
 
 macro_rules! engine_span {
@@ -44,7 +42,6 @@ impl<Eth, EthFilter>
         RpcTxReq<Eth::NetworkTypes>,
         RpcBlock<Eth::NetworkTypes>,
         RpcReceipt<Eth::NetworkTypes>,
-        RpcLog<Eth::NetworkTypes>,
     > for EngineEthApi<Eth, EthFilter>
 where
     Eth: EthApiServer<
@@ -55,7 +52,7 @@ where
             RpcHeader<Eth::NetworkTypes>,
             TxTy<Eth::Primitives>,
         > + FullEthApiTypes,
-    EthFilter: EngineEthFilter<RpcLog<Eth::NetworkTypes>>,
+    EthFilter: EngineEthFilter,
 {
     /// Handler for: `eth_syncing`
     fn syncing(&self) -> Result<SyncStatus> {
@@ -122,30 +119,6 @@ where
         self.eth.block_receipts(block_id).instrument(engine_span!()).await
     }
 
-    /// Handler for: `eth_getRawTransactionByBlockHashAndIndex`
-    async fn raw_transaction_by_block_hash_and_index(
-        &self,
-        hash: B256,
-        index: Index,
-    ) -> Result<Option<Bytes>> {
-        self.eth
-            .raw_transaction_by_block_hash_and_index(hash, index)
-            .instrument(engine_span!())
-            .await
-    }
-
-    /// Handler for: `eth_getRawTransactionByBlockNumberAndIndex`
-    async fn raw_transaction_by_block_number_and_index(
-        &self,
-        number: BlockNumberOrTag,
-        index: Index,
-    ) -> Result<Option<Bytes>> {
-        self.eth
-            .raw_transaction_by_block_number_and_index(number, index)
-            .instrument(engine_span!())
-            .await
-    }
-
     /// Handler for: `eth_sendRawTransaction`
     async fn send_raw_transaction(&self, bytes: Bytes) -> Result<B256> {
         self.eth.send_raw_transaction(bytes).instrument(engine_span!()).await
@@ -159,7 +132,7 @@ where
     }
 
     /// Handler for `eth_getLogs`
-    async fn logs(&self, filter: Filter) -> Result<Vec<RpcLog<Eth::NetworkTypes>>> {
+    async fn logs(&self, filter: Filter) -> Result<Vec<Log>> {
         self.eth_filter.logs(filter, QueryLimits::no_limits()).instrument(engine_span!()).await
     }
 
@@ -171,37 +144,5 @@ where
         block_number: Option<BlockId>,
     ) -> Result<EIP1186AccountProofResponse> {
         self.eth.get_proof(address, keys, block_number).instrument(engine_span!()).await
-    }
-
-    /// Handler for `eth_getMultiProof`
-    async fn get_multi_proof(
-        &self,
-        targets: Vec<(Address, Vec<B256>)>,
-        block_number: Option<BlockId>,
-    ) -> Result<Vec<EIP1186AccountProofResponse>> {
-        self.eth.get_multi_proof(targets, block_number).instrument(engine_span!()).await
-    }
-
-    /// Handler for `eth_getBlockAccessListByBlockHash`
-    async fn block_access_list_by_block_hash(&self, hash: B256) -> Result<Option<Value>> {
-        self.eth.block_access_list_by_block_hash(hash).instrument(engine_span!()).await
-    }
-
-    /// Handler for `eth_getBlockAccessListByBlockNumber`
-    async fn block_access_list_by_block_number(
-        &self,
-        block_number: BlockNumberOrTag,
-    ) -> Result<Option<Value>> {
-        self.eth.block_access_list_by_block_number(block_number).instrument(engine_span!()).await
-    }
-
-    /// Handler for `eth_getBlockAccessList`
-    async fn block_access_list(&self, block_id: BlockId) -> Result<Option<Value>> {
-        self.eth.block_access_list(block_id).instrument(engine_span!()).await
-    }
-
-    /// Handler for `getBlockAccessListRaw`
-    async fn block_access_list_raw(&self, block: BlockId) -> Result<Option<Bytes>> {
-        self.eth.block_access_list_raw(block).instrument(engine_span!()).await
     }
 }

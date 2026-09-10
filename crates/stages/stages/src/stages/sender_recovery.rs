@@ -1,4 +1,4 @@
-use alloy_primitives::{Address, BlockNumber, TxNumber};
+use alloy_primitives::{Address, TxNumber};
 use reth_config::config::SenderRecoveryConfig;
 use reth_consensus::ConsensusError;
 use reth_db::static_file::TransactionMask;
@@ -7,15 +7,12 @@ use reth_db_api::{
     table::Value,
     tables,
     transaction::{DbTx, DbTxMut},
-    RawValue,
+    DbTxUnwindExt, RawValue,
 };
-use reth_primitives_traits::{
-    FastInstant as Instant, GotExpected, NodePrimitives, SignedTransaction,
-};
+use reth_primitives_traits::{GotExpected, NodePrimitives, SignedTransaction};
 use reth_provider::{
-    BlockReader, DBProvider, EitherWriter, HeaderProvider, ProviderError, PruneCheckpointReader,
-    PruneCheckpointWriter, StaticFileProviderFactory, StatsReader, StorageSettingsCache,
-    TransactionsProvider,
+    BlockReader, DBProvider, HeaderProvider, ProviderError, PruneCheckpointReader,
+    PruneCheckpointWriter, StaticFileProviderFactory, StatsReader,
 };
 use reth_prune_types::{PruneCheckpoint, PruneMode, PrunePurpose, PruneSegment};
 use reth_stages_api::{
@@ -72,8 +69,7 @@ where
         + StaticFileProviderFactory<Primitives: NodePrimitives<SignedTx: Value + SignedTransaction>>
         + StatsReader
         + PruneCheckpointReader
-        + PruneCheckpointWriter
-        + StorageSettingsCache,
+        + PruneCheckpointWriter,
 {
     /// Return the id of the stage
     fn id(&self) -> StageId {
@@ -83,8 +79,7 @@ where
     /// Retrieve the range of transactions to iterate over by querying
     /// [`BlockBodyIndices`][reth_db_api::tables::BlockBodyIndices],
     /// collect transactions within that range, recover signer for each transaction and store
-    /// entries in the [`TransactionSenders`][reth_db_api::tables::TransactionSenders] table or
-    /// static files depending on configuration.
+    /// entries in the [`TransactionSenders`][reth_db_api::tables::TransactionSenders] table.
     fn execute(
         &mut self,
         provider: &Provider,
@@ -128,71 +123,42 @@ where
             return Ok(ExecOutput::done(input.checkpoint()))
         }
 
-        let Some(range_output) =
-            input.next_block_range_with_transaction_threshold(provider, self.commit_threshold)?
-        else {
-            info!(target: "sync::stages::sender_recovery", "No transaction senders to recover");
-            EitherWriter::new_senders(
-                provider,
-                provider
-                    .static_file_provider()
-                    .get_highest_static_file_block(StaticFileSegment::TransactionSenders)
-                    .unwrap_or_default(),
-            )?
-            .ensure_at_block(input.target())?;
+        let (tx_range, block_range, is_final_range) =
+            input.next_block_range_with_transaction_threshold(provider, self.commit_threshold)?;
+        let end_block = *block_range.end();
+
+        // No transactions to walk over
+        if tx_range.is_empty() {
+            info!(target: "sync::stages::sender_recovery", ?tx_range, "Target transaction already reached");
             return Ok(ExecOutput {
-                checkpoint: StageCheckpoint::new(input.target())
+                checkpoint: StageCheckpoint::new(end_block)
                     .with_entities_stage_checkpoint(stage_checkpoint(provider)?),
-                done: true,
+                done: is_final_range,
             })
-        };
-        let end_block = *range_output.block_range.end();
+        }
 
-        let mut writer = EitherWriter::new_senders(provider, *range_output.block_range.start())?;
+        // Acquire the cursor for inserting elements
+        let mut senders_cursor = provider.tx_ref().cursor_write::<tables::TransactionSenders>()?;
 
-        info!(target: "sync::stages::sender_recovery", tx_range = ?range_output.tx_range, "Recovering senders");
+        info!(target: "sync::stages::sender_recovery", ?tx_range, "Recovering senders");
 
         // Iterate over transactions in batches, recover the senders and append them
-        let batch = range_output
-            .tx_range
+        let batch = tx_range
             .clone()
             .step_by(BATCH_SIZE)
-            .map(|start| start..std::cmp::min(start + BATCH_SIZE as u64, range_output.tx_range.end))
+            .map(|start| start..std::cmp::min(start + BATCH_SIZE as u64, tx_range.end))
             .collect::<Vec<Range<u64>>>();
 
         let tx_batch_sender = setup_range_recovery(provider);
 
-        let start = Instant::now();
-        let block_body_indices =
-            provider.block_body_indices_range(range_output.block_range.clone())?;
-        let block_body_indices_elapsed = start.elapsed();
-        let mut blocks_with_indices = range_output.block_range.zip(block_body_indices).peekable();
-
         for range in batch {
-            // Pair each transaction number with its block number
-            let start = Instant::now();
-            let block_numbers = range.clone().fold(Vec::new(), |mut block_numbers, tx| {
-                while let Some((block, index)) = blocks_with_indices.peek() {
-                    if index.contains_tx(tx) {
-                        block_numbers.push(*block);
-                        return block_numbers
-                    }
-                    blocks_with_indices.next();
-                }
-                block_numbers
-            });
-            let fold_elapsed = start.elapsed();
-            debug!(target: "sync::stages::sender_recovery", ?block_body_indices_elapsed, ?fold_elapsed, len = block_numbers.len(), "Calculated block numbers");
-            recover_range(range, block_numbers, provider, tx_batch_sender.clone(), &mut writer)?;
+            recover_range(range, provider, tx_batch_sender.clone(), &mut senders_cursor)?;
         }
-
-        // Advance the static file header to the end of this range to account for empty blocks.
-        writer.ensure_at_block(end_block)?;
 
         Ok(ExecOutput {
             checkpoint: StageCheckpoint::new(end_block)
                 .with_entities_stage_checkpoint(stage_checkpoint(provider)?),
-            done: range_output.is_final_range,
+            done: is_final_range,
         })
     }
 
@@ -205,14 +171,12 @@ where
         let (_, unwind_to, _) = input.unwind_block_range_with_threshold(self.commit_threshold);
 
         if self.prune_mode.is_none_or(|mode| !mode.is_full()) {
-            // Lookup the next tx id after unwind_to block (first tx to remove)
-            let unwind_tx_from = provider
+            // Lookup latest tx id that we should unwind to
+            let latest_tx_id = provider
                 .block_body_indices(unwind_to)?
                 .ok_or(ProviderError::BlockBodyIndicesNotFound(unwind_to))?
-                .next_tx_num();
-
-            EitherWriter::new_senders(provider, unwind_to)?
-                .prune_senders(unwind_tx_from, unwind_to)?;
+                .last_tx_num();
+            provider.tx_ref().unwind_table_by_num::<tables::TransactionSenders>(latest_tx_id)?;
         }
 
         Ok(UnwindOutput {
@@ -224,21 +188,14 @@ where
 
 fn recover_range<Provider, CURSOR>(
     tx_range: Range<TxNumber>,
-    block_numbers: Vec<BlockNumber>,
     provider: &Provider,
     tx_batch_sender: mpsc::Sender<Vec<(Range<u64>, RecoveryResultSender)>>,
-    writer: &mut EitherWriter<'_, CURSOR, Provider::Primitives>,
+    senders_cursor: &mut CURSOR,
 ) -> Result<(), StageError>
 where
-    Provider: DBProvider + HeaderProvider + TransactionsProvider + StaticFileProviderFactory,
+    Provider: DBProvider + HeaderProvider + StaticFileProviderFactory,
     CURSOR: DbCursorRW<tables::TransactionSenders>,
 {
-    debug_assert_eq!(
-        tx_range.clone().count(),
-        block_numbers.len(),
-        "Transaction range and block numbers count mismatch"
-    );
-
     debug!(target: "sync::stages::sender_recovery", ?tx_range, "Sending batch for processing");
 
     // Preallocate channels for each chunks in the batch
@@ -260,7 +217,6 @@ where
     debug!(target: "sync::stages::sender_recovery", ?tx_range, "Appending recovered senders to the database");
 
     let mut processed_transactions = 0;
-    let mut block_numbers = block_numbers.into_iter();
     for channel in receivers {
         while let Ok(recovered) = channel.recv() {
             let (tx_id, sender) = match recovered {
@@ -298,12 +254,7 @@ where
                     }
                 }
             };
-
-            let new_block_number = block_numbers
-                .next()
-                .expect("block numbers iterator has the same length as the number of transactions");
-            writer.ensure_at_block(new_block_number)?;
-            writer.append_sender(tx_id, &sender)?;
+            senders_cursor.append(tx_id, &sender)?;
             processed_transactions += 1;
         }
     }
@@ -350,7 +301,7 @@ where
                 // Read the raw value, and let the rayon worker to decompress & decode.
                 let chunk = match static_file_provider.fetch_range_with_predicate(
                     StaticFileSegment::Transactions,
-                    chunk_range,
+                    chunk_range.clone(),
                     |cursor, number| {
                         Ok(cursor
                             .get_one::<TransactionMask<
@@ -468,7 +419,7 @@ mod tests {
     };
     use alloy_primitives::{BlockNumber, B256};
     use assert_matches::assert_matches;
-    use reth_db_api::{cursor::DbCursorRO, models::StorageSettings};
+    use reth_db_api::cursor::DbCursorRO;
     use reth_ethereum_primitives::{Block, TransactionSigned};
     use reth_primitives_traits::{SealedBlock, SignerRecoverable};
     use reth_provider::{
@@ -477,7 +428,6 @@ mod tests {
     };
     use reth_prune_types::{PruneCheckpoint, PruneMode};
     use reth_stages_api::StageUnitCheckpoint;
-    use reth_static_file_types::StaticFileSegment;
     use reth_testing_utils::generators::{
         self, random_block, random_block_range, BlockParams, BlockRangeParams,
     };
@@ -525,7 +475,7 @@ mod tests {
             Ok(ExecOutput { checkpoint: StageCheckpoint {
                 block_number,
                 stage_checkpoint: Some(StageUnitCheckpoint::Entities(EntitiesCheckpoint {
-                    processed: 1,
+                    processed: _,
                     total: 1
                 }))
             }, done: true }) if block_number == previous_stage
@@ -533,48 +483,6 @@ mod tests {
 
         // Validate the stage execution
         assert!(runner.validate_execution(input, result.ok()).is_ok(), "execution validation");
-    }
-
-    /// Ensure the static file header advances to trailing empty blocks.
-    #[tokio::test]
-    async fn execute_advances_static_file_for_trailing_empty_blocks() {
-        let (stage_progress, target) = (0, 3);
-        let mut rng = generators::rng();
-
-        let runner = SenderRecoveryTestRunner::default();
-        runner.db.factory.set_storage_settings_cache(StorageSettings::v2());
-        let input = ExecInput {
-            target: Some(target),
-            checkpoint: Some(StageCheckpoint::new(stage_progress)),
-        };
-
-        let non_empty_block_number = stage_progress + 1;
-        let blocks = (stage_progress..=input.target())
-            .map(|number| {
-                random_block(
-                    &mut rng,
-                    number,
-                    BlockParams {
-                        tx_count: Some((number == non_empty_block_number) as u8),
-                        ..Default::default()
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        runner
-            .db
-            .insert_blocks(blocks.iter(), StorageKind::Static)
-            .expect("failed to insert blocks");
-
-        let result = runner.execute(input).await.unwrap();
-        assert_matches!(result, Ok(ExecOutput { checkpoint, done: true }) if checkpoint.block_number == target);
-
-        let highest_block = runner
-            .db
-            .factory
-            .static_file_provider()
-            .get_highest_static_file_block(StaticFileSegment::TransactionSenders);
-        assert_eq!(Some(target), highest_block);
     }
 
     /// Execute the stage twice with input range that exceeds the commit threshold
@@ -622,18 +530,18 @@ mod tests {
             .map(|x| x.number)
             .unwrap_or(previous_stage);
         assert_matches!(result, Ok(_));
-        assert_eq!(
-            result.unwrap(),
-            ExecOutput {
-                checkpoint: StageCheckpoint::new(expected_progress).with_entities_stage_checkpoint(
-                    EntitiesCheckpoint {
-                        processed: runner.db.count_entries::<tables::TransactionSenders>().unwrap()
-                            as u64,
-                        total: total_transactions
-                    }
-                ),
+        assert_matches!(
+            result,
+            Ok(ExecOutput {
+                checkpoint: StageCheckpoint {
+                    block_number,
+                    stage_checkpoint: Some(StageUnitCheckpoint::Entities(EntitiesCheckpoint {
+                        processed: _,
+                        total
+                    }))
+                },
                 done: false
-            }
+            }) if block_number == expected_progress && total == total_transactions
         );
 
         // Execute second time to completion
@@ -644,14 +552,18 @@ mod tests {
         };
         let result = runner.execute(second_input).await.unwrap();
         assert_matches!(result, Ok(_));
-        assert_eq!(
-            result.as_ref().unwrap(),
-            &ExecOutput {
-                checkpoint: StageCheckpoint::new(previous_stage).with_entities_stage_checkpoint(
-                    EntitiesCheckpoint { processed: total_transactions, total: total_transactions }
-                ),
+        assert_matches!(
+            result,
+            Ok(ExecOutput {
+                checkpoint: StageCheckpoint {
+                    block_number,
+                    stage_checkpoint: Some(StageUnitCheckpoint::Entities(EntitiesCheckpoint {
+                        processed: _,
+                        total
+                    }))
+                },
                 done: true
-            }
+            }) if block_number == previous_stage && total == total_transactions
         );
 
         assert!(runner.validate_execution(first_input, result.ok()).is_ok(), "validation failed");

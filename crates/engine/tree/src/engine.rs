@@ -5,15 +5,16 @@ use crate::{
     chain::{ChainHandler, FromOrchestrator, HandlerEvent},
     download::{BlockDownloader, DownloadAction, DownloadOutcome},
 };
-use alloy_primitives::{map::B256Set, B256};
+use alloy_primitives::B256;
 use crossbeam_channel::Sender;
 use futures::{Stream, StreamExt};
+use reth_chain_state::ExecutedBlockWithTrieUpdates;
 use reth_engine_primitives::{BeaconEngineMessage, ConsensusEngineEvent};
 use reth_ethereum_primitives::EthPrimitives;
-use reth_network_p2p::full_block::SealedBlockWithAccessList;
-use reth_payload_primitives::{BuiltPayloadExecutedBlock, PayloadTypes};
-use reth_primitives_traits::{Block, NodePrimitives};
+use reth_payload_primitives::PayloadTypes;
+use reth_primitives_traits::{Block, NodePrimitives, RecoveredBlock};
 use std::{
+    collections::HashSet,
     fmt::Display,
     task::{ready, Context, Poll},
 };
@@ -233,7 +234,7 @@ impl EngineApiKind {
         matches!(self, Self::Ethereum)
     }
 
-    /// Returns true if this is the opstack variant
+    /// Returns true if this is the ethereum variant
     pub const fn is_opstack(&self) -> bool {
         matches!(self, Self::OpStack)
     }
@@ -245,15 +246,15 @@ pub enum EngineApiRequest<T: PayloadTypes, N: NodePrimitives> {
     /// A request received from the consensus engine.
     Beacon(BeaconEngineMessage<T>),
     /// Request to insert an already executed block, e.g. via payload building.
-    InsertExecutedBlock(BuiltPayloadExecutedBlock<N>),
+    InsertExecutedBlock(ExecutedBlockWithTrieUpdates<N>),
 }
 
 impl<T: PayloadTypes, N: NodePrimitives> Display for EngineApiRequest<T, N> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Beacon(msg) => msg.fmt(f),
-            Self::InsertExecutedBlock(payload) => {
-                write!(f, "InsertExecutedBlock({:?})", payload.recovered_block.num_hash())
+            Self::InsertExecutedBlock(block) => {
+                write!(f, "InsertExecutedBlock({:?})", block.recovered_block().num_hash())
             }
         }
     }
@@ -306,7 +307,7 @@ pub enum FromEngine<Req, B: Block> {
     /// Request from the engine.
     Request(Req),
     /// Downloaded blocks from the network.
-    DownloadedBlocks(Vec<SealedBlockWithAccessList<B>>),
+    DownloadedBlocks(Vec<RecoveredBlock<B>>),
 }
 
 impl<Req: Display, B: Block> Display for FromEngine<Req, B> {
@@ -340,49 +341,14 @@ pub enum RequestHandlerEvent<T> {
 #[derive(Debug)]
 pub enum DownloadRequest {
     /// Download the given set of blocks.
-    BlockSet {
-        /// The hashes of the blocks to download.
-        hashes: B256Set,
-        /// Whether to also attempt to download the blocks' access lists.
-        access_lists: bool,
-    },
+    BlockSet(HashSet<B256>),
     /// Download the given range of blocks.
-    BlockRange {
-        /// The hash of the highest block of the range.
-        hash: B256,
-        /// The number of blocks to download.
-        count: u64,
-        /// Whether to also attempt to download the blocks' access lists.
-        access_lists: bool,
-    },
+    BlockRange(B256, u64),
 }
 
 impl DownloadRequest {
     /// Returns a [`DownloadRequest`] for a single block.
     pub fn single_block(hash: B256) -> Self {
-        Self::block_set(B256Set::from_iter([hash]))
-    }
-
-    /// Returns a [`DownloadRequest`] for the given set of blocks.
-    pub const fn block_set(hashes: B256Set) -> Self {
-        Self::BlockSet { hashes, access_lists: false }
-    }
-
-    /// Returns a [`DownloadRequest`] for the given range of blocks.
-    pub const fn block_range(hash: B256, count: u64) -> Self {
-        Self::BlockRange { hash, count, access_lists: false }
-    }
-
-    /// Configures whether the download should also attempt to fetch the blocks' access lists.
-    ///
-    /// Access list downloads are best-effort: blocks are returned without access list data if no
-    /// peer can serve them.
-    pub const fn with_access_lists(mut self, access_lists: bool) -> Self {
-        match &mut self {
-            Self::BlockSet { access_lists: al, .. } | Self::BlockRange { access_lists: al, .. } => {
-                *al = access_lists
-            }
-        }
-        self
+        Self::BlockSet(HashSet::from([hash]))
     }
 }

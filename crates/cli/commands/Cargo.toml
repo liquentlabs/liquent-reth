@@ -18,7 +18,7 @@ reth-cli-util.workspace = true
 reth-codecs.workspace = true
 reth-config = { workspace = true, features = ["serde"] }
 reth-consensus.workspace = true
-reth-db = { workspace = true, features = ["mdbx"] }
+reth-db = { workspace = true }
 reth-db-api.workspace = true
 reth-db-common.workspace = true
 reth-downloaders = { workspace = true, features = ["file-client"] }
@@ -41,6 +41,7 @@ reth-node-core.workspace = true
 reth-node-events.workspace = true
 reth-node-metrics.workspace = true
 reth-ethereum-primitives = { workspace = true, optional = true }
+reth-engine-tree.workspace = true
 reth-provider.workspace = true
 reth-prune.workspace = true
 reth-prune-types.workspace = true
@@ -53,13 +54,13 @@ reth-tasks.workspace = true
 reth-storage-api.workspace = true
 reth-trie = { workspace = true, features = ["metrics"] }
 reth-trie-db = { workspace = true, features = ["metrics"] }
-reth-trie-common = { workspace = true, optional = true }
+reth-trie-common.workspace = true
 reth-primitives-traits.workspace = true
 reth-discv4.workspace = true
 reth-discv5.workspace = true
+liquent-primitives.workspace = true
 
 # ethereum
-alloy-eip7928.workspace = true
 alloy-eips.workspace = true
 alloy-primitives.workspace = true
 alloy-rlp.workspace = true
@@ -68,8 +69,7 @@ alloy-chains.workspace = true
 
 itertools.workspace = true
 futures.workspace = true
-tokio = { workspace = true, features = ["net"] }
-socket2 = { workspace = true, features = ["all"] }
+tokio.workspace = true
 
 # misc
 humantime.workspace = true
@@ -80,7 +80,6 @@ lz4.workspace = true
 zstd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-parking_lot.workspace = true
 tar.workspace = true
 tracing.workspace = true
 backon.workspace = true
@@ -88,7 +87,6 @@ secp256k1 = { workspace = true, features = ["global-context", "std", "recovery"]
 tokio-stream.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 url.workspace = true
-metrics.workspace = true
 blake3.workspace = true
 rayon.workspace = true
 
@@ -107,33 +105,32 @@ arbitrary = { workspace = true, optional = true }
 proptest-arbitrary-interop = { workspace = true, optional = true }
 
 [dev-dependencies]
+alloy-genesis.workspace = true
 reth-ethereum-cli.workspace = true
 reth-provider = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [features]
+default = []
 arbitrary = [
     "dep:proptest",
     "dep:arbitrary",
     "dep:proptest-arbitrary-interop",
-    "dep:reth-trie-common",
     "reth-db-api/arbitrary",
     "reth-eth-wire/arbitrary",
     "reth-db/arbitrary",
     "reth-chainspec/arbitrary",
     "alloy-chains/arbitrary",
-    "alloy-eip7928/arbitrary",
     "alloy-eips/arbitrary",
     "alloy-primitives/arbitrary",
     "reth-codecs/test-utils",
     "reth-prune-types/test-utils",
     "reth-stages-types/test-utils",
-    "reth-trie-common?/test-utils",
+    "reth-trie-common/test-utils",
     "reth-codecs/arbitrary",
     "reth-prune-types/arbitrary",
     "reth-stages-types/arbitrary",
-    "reth-trie-common?/arbitrary",
+    "reth-trie-common/arbitrary",
     "alloy-consensus/arbitrary",
     "reth-primitives-traits/arbitrary",
     "reth-ethereum-primitives/arbitrary",

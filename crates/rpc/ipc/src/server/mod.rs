@@ -68,7 +68,7 @@ impl<HttpMiddleware, RpcMiddleware> IpcServer<HttpMiddleware, RpcMiddleware> {
 
 impl<HttpMiddleware, RpcMiddleware> IpcServer<HttpMiddleware, RpcMiddleware>
 where
-    RpcMiddleware: Layer<RpcService, Service: RpcServiceT> + Clone + Send + 'static,
+    RpcMiddleware: for<'a> Layer<RpcService, Service: RpcServiceT> + Clone + Send + 'static,
     HttpMiddleware: Layer<
             TowerServiceNoHttp<RpcMiddleware>,
             Service: Service<
@@ -371,8 +371,8 @@ pub struct TowerServiceNoHttp<L> {
 
 impl<RpcMiddleware> Service<String> for TowerServiceNoHttp<RpcMiddleware>
 where
-    RpcMiddleware: Layer<RpcService>,
-    <RpcMiddleware as Layer<RpcService>>::Service:
+    RpcMiddleware: for<'a> Layer<RpcService>,
+    for<'a> <RpcMiddleware as Layer<RpcService>>::Service:
         Send + Sync + 'static + RpcServiceT<MethodResponse = MethodResponse>,
 {
     /// The response of a handled RPC call
@@ -461,7 +461,7 @@ fn process_connection<RpcMiddleware, HttpMiddleware>(
     >,
     <<HttpMiddleware as Layer<TowerServiceNoHttp<RpcMiddleware>>>::Service as Service<String>>::Future:
     Send + Unpin,
-{
+ {
     let ProcessConnection {
         http_middleware,
         rpc_middleware,
@@ -536,7 +536,7 @@ async fn to_ipc_service<S, T>(
             }
             item = rx_item.next() => {
                 let Some(item) = item else { break };
-                conn.push_back(String::from(Box::<str>::from(item)));
+                conn.push_back(item.to_string());
             }
             _ = &mut stopped => {
                 // shutdown

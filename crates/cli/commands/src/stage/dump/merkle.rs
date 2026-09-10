@@ -13,7 +13,7 @@ use reth_exex::ExExManagerHandle;
 use reth_node_api::HeaderTy;
 use reth_node_core::dirs::{ChainPath, DataDirPath};
 use reth_provider::{
-    providers::{ProviderNodeTypes, RocksDBProvider, StaticFileProvider},
+    providers::{ProviderNodeTypes, StaticFileProvider},
     DatabaseProviderFactory, ProviderFactory,
 };
 use reth_stages::{
@@ -25,7 +25,6 @@ use reth_stages::{
 };
 use tracing::info;
 
-#[expect(clippy::too_many_arguments)]
 pub(crate) async fn dump_merkle_stage<N>(
     db_tool: &DbTool<N>,
     from: BlockNumber,
@@ -34,10 +33,9 @@ pub(crate) async fn dump_merkle_stage<N>(
     should_run: bool,
     evm_config: impl ConfigureEvm<Primitives = N::Primitives>,
     consensus: impl FullConsensus<N::Primitives> + 'static,
-    runtime: reth_tasks::Runtime,
 ) -> Result<()>
 where
-    N: ProviderNodeTypes<DB = DatabaseEnv>,
+    N: ProviderNodeTypes<DB = Arc<DatabaseEnv>>,
 {
     let (output_db, tip_block_number) = setup(from, to, &output_datadir.db(), db_tool)?;
 
@@ -62,12 +60,10 @@ where
     if should_run {
         dry_run(
             ProviderFactory::<N>::new(
-                output_db,
+                Arc::new(output_db),
                 db_tool.chain(),
                 StaticFileProvider::read_write(output_datadir.static_files())?,
-                RocksDBProvider::builder(output_datadir.rocksdb()).build()?,
-                runtime,
-            )?,
+            ),
             to,
             from,
         )?;
@@ -178,7 +174,7 @@ where
             checkpoint: Some(StageCheckpoint::new(from)),
         };
         if stage.execute(&provider, input)?.done {
-            break
+            break;
         }
     }
 

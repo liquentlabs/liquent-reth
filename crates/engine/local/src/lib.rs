@@ -11,5 +11,5 @@
 pub mod miner;
 pub mod payload;
 
-pub use miner::{LocalMiner, MiningMode, DEFAULT_FINALITY_DEPTH};
+pub use miner::{LocalMiner, MiningMode};
 pub use payload::LocalPayloadAttributesBuilder;

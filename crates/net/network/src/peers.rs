@@ -6,7 +6,6 @@ use crate::{
     swarm::NetworkConnectionState,
     trusted_peers_resolver::TrustedPeersResolver,
 };
-use alloy_primitives::map::{hash_map::Entry, FbBuildHasher, HashMap, HashSet};
 use futures::StreamExt;
 
 use rand::Rng;
@@ -25,9 +24,9 @@ use reth_network_types::{
     PersistedPeerInfo, ReputationChangeKind, ReputationChangeOutcome, ReputationChangeWeights,
 };
 use std::{
-    collections::VecDeque,
+    collections::{hash_map::Entry, HashMap, HashSet, VecDeque},
     fmt::Display,
-    io,
+    io::{self},
     net::{IpAddr, SocketAddr},
     pin::Pin,
     task::{Context, Poll},
@@ -50,12 +49,12 @@ use tracing::{trace, warn};
 #[derive(Debug)]
 pub struct PeersManager {
     /// All peers known to the network
-    peers: HashMap<PeerId, Peer, FbBuildHasher<64>>,
+    peers: HashMap<PeerId, Peer>,
     /// The set of trusted peer ids.
     ///
     /// This tracks peer ids that are considered trusted, but for which we don't necessarily have
     /// an address: [`Self::add_trusted_peer_id`]
-    trusted_peer_ids: HashSet<PeerId, FbBuildHasher<64>>,
+    trusted_peer_ids: HashSet<PeerId>,
     /// A resolver used to periodically resolve DNS names for trusted peers. This updates the
     /// peer's address when the DNS records change.
     trusted_peers_resolver: TrustedPeersResolver,
@@ -74,7 +73,7 @@ pub struct PeersManager {
     /// Tracks unwanted ips/peer ids.
     ban_list: BanList,
     /// Tracks currently backed off peers.
-    backed_off_peers: HashMap<PeerId, std::time::Instant, FbBuildHasher<64>>,
+    backed_off_peers: HashMap<PeerId, std::time::Instant>,
     /// Interval at which to check for peers to unban and release from the backoff map.
     release_interval: Interval,
     /// How long to ban bad peers.
@@ -132,12 +131,9 @@ impl PeersManager {
         // We use half of the interval to decrease the max duration to `150%` in worst case
         let unban_interval = ban_duration.min(backoff_durations.low) / 2;
 
-        let mut peers: HashMap<PeerId, Peer, FbBuildHasher<64>> = HashMap::with_capacity_and_hasher(
-            trusted_nodes.len() + basic_nodes.len() + persisted_peers.len(),
-            Default::default(),
-        );
-        let mut trusted_peer_ids: HashSet<PeerId, FbBuildHasher<64>> =
-            HashSet::with_capacity_and_hasher(trusted_nodes.len(), Default::default());
+        let mut peers =
+            HashMap::with_capacity(trusted_nodes.len() + basic_nodes.len() + persisted_peers.len());
+        let mut trusted_peer_ids = HashSet::with_capacity(trusted_nodes.len());
 
         for trusted_peer in &trusted_nodes {
             match trusted_peer.resolve_blocking() {
@@ -546,18 +542,12 @@ impl PeersManager {
     pub(crate) fn apply_reputation_change(&mut self, peer_id: &PeerId, rep: ReputationChangeKind) {
         trace!(target: "net::peers", ?peer_id, reputation=?rep, "applying reputation change");
 
-        let reputation_change = if rep.is_reset() {
-            None
-        } else {
-            let reputation_change = self.reputation_weights.change(rep).as_i32();
-            if reputation_change == 0 {
-                return
-            }
-            Some(reputation_change)
-        };
-
         let outcome = if let Some(peer) = self.peers.get_mut(peer_id) {
-            if let Some(mut reputation_change) = reputation_change {
+            // First check if we should reset the reputation
+            if rep.is_reset() {
+                peer.reset_reputation()
+            } else {
+                let mut reputation_change = self.reputation_weights.change(rep).as_i32();
                 if peer.is_trusted() || peer.is_static() {
                     // exempt trusted and static peers from reputation slashing for
                     if matches!(
@@ -577,8 +567,6 @@ impl PeersManager {
                     }
                 }
                 peer.apply_reputation(reputation_change, rep)
-            } else {
-                peer.reset_reputation()
             }
         } else {
             return
@@ -938,32 +926,6 @@ impl PeersManager {
                 peer_id,
                 reason: Some(DisconnectReason::DisconnectRequested),
             })
-        }
-    }
-
-    /// Bans the peer indefinitely and removes it from the peer set.
-    ///
-    /// This follows [`Self::remove_peer`] and does not override trusted status. Remove trusted
-    /// peers from the trusted set before banning them.
-    pub(crate) fn ban_peer_by_admin(&mut self, peer_id: PeerId) {
-        if self.trusted_peer_ids.contains(&peer_id) ||
-            self.peers.get(&peer_id).is_some_and(Peer::is_trusted)
-        {
-            return
-        }
-
-        self.remove_peer(peer_id);
-        self.ban_list.ban_peer(peer_id);
-    }
-
-    /// Removes the peer from the ban list and resets its reputation.
-    pub(crate) fn unban_peer_by_admin(&mut self, peer_id: PeerId) {
-        self.ban_list.unban_peer(&peer_id);
-        if let Some(peer) = self.peers.get_mut(&peer_id) &&
-            peer.is_banned()
-        {
-            peer.unban();
-            self.queued_actions.push_back(PeerAction::UnBanPeer { peer_id });
         }
     }
 
@@ -1670,63 +1632,6 @@ mod tests {
             Poll::Ready(())
         })
         .await;
-    }
-
-    #[tokio::test]
-    async fn test_admin_ban_removes_peer_and_bans_indefinitely() {
-        let peer = PeerId::random();
-        let socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 1, 2)), 8008);
-        let mut peers = PeersManager::default();
-        peers.peers.insert(peer, Peer::new(PeerAddr::from_tcp(socket_addr)));
-
-        peers.ban_peer_by_admin(peer);
-
-        assert!(peers.ban_list.is_banned_peer(&peer));
-        assert!(peers.peer_by_id(peer).is_none());
-
-        match peers.queued_actions.pop_front() {
-            Some(PeerAction::PeerRemoved(peer_id)) => assert_eq!(peer_id, peer),
-            other => panic!("unexpected action: {other:?}"),
-        }
-
-        let (_, unbanned_peers) =
-            peers.ban_list.evict(std::time::Instant::now() + Duration::from_secs(1));
-        assert!(unbanned_peers.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_admin_ban_does_not_override_trusted_peer() {
-        let peer = PeerId::random();
-        let socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 1, 2)), 8008);
-        let mut peers = PeersManager::default();
-        peers.peers.insert(peer, Peer::trusted(PeerAddr::from_tcp(socket_addr)));
-
-        peers.ban_peer_by_admin(peer);
-
-        assert!(!peers.ban_list.is_banned_peer(&peer));
-        assert!(peers.peer_by_id(peer).is_some());
-        assert!(peers.queued_actions.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_admin_unban_resets_reputation() {
-        let peer = PeerId::random();
-        let socket_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 1, 2)), 8008);
-        let mut peers = PeersManager::default();
-        let mut peer_info = Peer::new(PeerAddr::from_tcp(socket_addr));
-        peer_info.reputation = i32::MIN;
-        peers.peers.insert(peer, peer_info);
-        peers.ban_list.ban_peer(peer);
-        assert!(peers.peers.get(&peer).is_some_and(Peer::is_banned));
-
-        peers.unban_peer_by_admin(peer);
-
-        assert!(!peers.ban_list.is_banned_peer(&peer));
-        assert!(!peers.peers.get(&peer).is_some_and(Peer::is_banned));
-        assert!(matches!(
-            peers.queued_actions.pop_front(),
-            Some(PeerAction::UnBanPeer { peer_id }) if peer_id == peer
-        ));
     }
 
     #[tokio::test]
@@ -2912,8 +2817,7 @@ mod tests {
         let peer_id = PeerId::random();
         peer_manager.add_peer(peer_id, PeerAddr::from_tcp(socket_addr), None);
 
-        // Age the last tick directly so each reputation update sees a full elapsed second.
-        peer_manager.last_tick -= Duration::from_secs(1);
+        tokio::time::sleep(Duration::from_secs(1)).await;
         peer_manager.tick();
 
         // still unconnected
@@ -2922,7 +2826,7 @@ mod tests {
         // mark as connected
         peer_manager.peers.get_mut(&peer_id).unwrap().state = PeerConnectionState::Out;
 
-        peer_manager.last_tick -= Duration::from_secs(1);
+        tokio::time::sleep(Duration::from_secs(1)).await;
         peer_manager.tick();
 
         // still at default reputation
@@ -2930,7 +2834,7 @@ mod tests {
 
         peer_manager.peers.get_mut(&peer_id).unwrap().reputation -= 1;
 
-        peer_manager.last_tick -= Duration::from_secs(1);
+        tokio::time::sleep(Duration::from_secs(1)).await;
         peer_manager.tick();
 
         // tick applied

@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand};
 use reth_chainspec::{ChainSpec, Hardforks};
 use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_commands::{
-    common::{CliComponentsBuilder, CliNodeTypes, HeaderMut},
+    common::{CliComponentsBuilder, CliHeader, CliNodeTypes},
     config_cmd, db, download,
     download::manifest_cmd,
     dump_genesis, export_era, import, import_era, init_cmd, init_state,
@@ -70,34 +70,6 @@ impl Cli {
     }
 }
 
-impl<C, Ext, Rpc, SubCmd> Cli<C, Ext, Rpc, SubCmd>
-where
-    C: ChainSpecParser,
-    Ext: clap::Args + fmt::Debug,
-    Rpc: RpcModuleValidator,
-    SubCmd: Subcommand + fmt::Debug,
-{
-    /// Returns the node command, if this CLI was invoked with `node`.
-    pub fn as_node_command_mut(&mut self) -> Option<&mut node::NodeCommand<C, Ext>> {
-        match &mut self.command {
-            Commands::Node(command) => Some(command.as_mut()),
-            _ => None,
-        }
-    }
-
-    /// Applies a closure to the node command, if this CLI was invoked with `node`.
-    pub fn apply_node_command(
-        &mut self,
-        f: impl FnOnce(&mut node::NodeCommand<C, Ext>),
-    ) -> &mut Self {
-        if let Some(command) = self.as_node_command_mut() {
-            f(command);
-        }
-
-        self
-    }
-}
-
 impl<
         C: ChainSpecParser,
         Ext: clap::Args + fmt::Debug,
@@ -157,7 +129,7 @@ impl<
     /// ````
     pub fn run<L, Fut>(self, launcher: L) -> eyre::Result<()>
     where
-        L: FnOnce(WithLaunchContext<NodeBuilder<DatabaseEnv, C::ChainSpec>>, Ext) -> Fut,
+        L: FnOnce(WithLaunchContext<NodeBuilder<Arc<DatabaseEnv>, C::ChainSpec>>, Ext) -> Fut,
         Fut: Future<Output = eyre::Result<()>>,
         C: ChainSpecParser<ChainSpec = ChainSpec>,
     {
@@ -175,12 +147,12 @@ impl<
         self,
         components: impl CliComponentsBuilder<N>,
         launcher: impl AsyncFnOnce(
-            WithLaunchContext<NodeBuilder<DatabaseEnv, C::ChainSpec>>,
+            WithLaunchContext<NodeBuilder<Arc<DatabaseEnv>, C::ChainSpec>>,
             Ext,
         ) -> eyre::Result<()>,
     ) -> eyre::Result<()>
     where
-        N: CliNodeTypes<Primitives: NodePrimitives<BlockHeader: HeaderMut>, ChainSpec: Hardforks>,
+        N: CliNodeTypes<Primitives: NodePrimitives<BlockHeader: CliHeader>, ChainSpec: Hardforks>,
         C: ChainSpecParser<ChainSpec = N::ChainSpec>,
     {
         self.configure().run_with_components(components, launcher)
@@ -207,7 +179,7 @@ impl<
     /// ```
     pub fn with_runner<L, Fut>(self, runner: CliRunner, launcher: L) -> eyre::Result<()>
     where
-        L: FnOnce(WithLaunchContext<NodeBuilder<DatabaseEnv, C::ChainSpec>>, Ext) -> Fut,
+        L: FnOnce(WithLaunchContext<NodeBuilder<Arc<DatabaseEnv>, C::ChainSpec>>, Ext) -> Fut,
         Fut: Future<Output = eyre::Result<()>>,
         C: ChainSpecParser<ChainSpec = ChainSpec>,
     {
@@ -223,12 +195,12 @@ impl<
         runner: CliRunner,
         components: impl CliComponentsBuilder<N>,
         launcher: impl AsyncFnOnce(
-            WithLaunchContext<NodeBuilder<DatabaseEnv, C::ChainSpec>>,
+            WithLaunchContext<NodeBuilder<Arc<DatabaseEnv>, C::ChainSpec>>,
             Ext,
         ) -> eyre::Result<()>,
     ) -> eyre::Result<()>
     where
-        N: CliNodeTypes<Primitives: NodePrimitives<BlockHeader: HeaderMut>, ChainSpec: Hardforks>,
+        N: CliNodeTypes<Primitives: NodePrimitives<BlockHeader: CliHeader>, ChainSpec: Hardforks>,
         C: ChainSpecParser<ChainSpec = N::ChainSpec>,
     {
         let mut app = self.configure();
@@ -402,30 +374,6 @@ mod tests {
     fn parse_color_mode() {
         let reth = Cli::try_parse_args_from(["reth", "node", "--color", "always"]).unwrap();
         assert_eq!(reth.logs.color, ColorMode::Always);
-    }
-
-    #[test]
-    fn node_command_mut_accessor_returns_node_command() {
-        let mut reth = Cli::try_parse_args_from(["reth", "node"]).unwrap();
-
-        let node_command = reth.as_node_command_mut().expect("expected node command");
-        node_command.with_unused_ports = true;
-
-        assert!(reth.as_node_command_mut().unwrap().with_unused_ports);
-    }
-
-    #[test]
-    fn apply_node_command_only_runs_for_node_command() {
-        let mut reth = Cli::try_parse_args_from(["reth", "node"]).unwrap();
-        reth.apply_node_command(|node_command| node_command.with_unused_ports = true);
-        assert!(reth.as_node_command_mut().unwrap().with_unused_ports);
-
-        let mut reth = Cli::try_parse_args_from(["reth", "config"]).unwrap();
-        let mut applied = false;
-        reth.apply_node_command(|_| applied = true);
-
-        assert!(reth.as_node_command_mut().is_none());
-        assert!(!applied);
     }
 
     /// Tests that the help message is parsed correctly. This ensures that clap args are configured

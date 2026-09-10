@@ -1,0 +1,60 @@
+//! clap [Args](clap::Args) for liquent purposes
+
+use clap::Args;
+
+/// Parameters for configuring the liquent driver.
+#[derive(Debug, Clone, Args, PartialEq, Eq)]
+#[command(next_help_heading = "Liquent")]
+pub struct LiquentArgs {
+    /// Disable pipe execution. default false.
+    #[arg(long = "liquent.disable-pipe-execution", default_value = "false")]
+    pub disable_pipe_execution: bool,
+
+    /// Disable the Levm executor. default false.
+    #[arg(long = "liquent.disable-levm", default_value = "false")]
+    pub disable_levm: bool,
+
+    /// The max block height between merged and pesist block height.
+    #[arg(long = "liquent.cache.max-persist-gap", default_value_t = 128)]
+    pub cache_max_persist_gap: u64,
+
+    /// Persist consecutive blocks in merged groups to amortize per-block fsyncs (much faster
+    /// from-genesis catch-up). Incompatible with Storage V2. default false.
+    #[arg(long = "liquent.persist.merge-blocks", default_value = "false")]
+    pub persist_merge_blocks: bool,
+
+    /// The max size of cached items
+    #[arg(long = "liquent.cache.capacity", default_value_t = 2_000_000, value_parser = clap::value_parser!(u64).range(1_000..=100_000_000))]
+    pub cache_capacity: u64,
+
+    /// Report db metrics. default false.
+    #[arg(long = "liquent.report-db-metrics", default_value = "false")]
+    pub report_db_metrics: bool,
+}
+
+impl Default for LiquentArgs {
+    fn default() -> Self {
+        Self {
+            disable_pipe_execution: false,
+            disable_levm: false,
+            cache_max_persist_gap: 128,
+            persist_merge_blocks: false,
+            cache_capacity: 2_000_000,
+            report_db_metrics: false,
+        }
+    }
+}
+
+impl LiquentArgs {
+    /// Convert to liquent primitives config
+    pub const fn to_config(&self) -> liquent_primitives::Config {
+        liquent_primitives::Config {
+            disable_pipe_execution: self.disable_pipe_execution,
+            disable_levm: self.disable_levm,
+            cache_max_persist_gap: self.cache_max_persist_gap,
+            persist_merge_blocks: self.persist_merge_blocks,
+            cache_capacity: self.cache_capacity,
+            report_db_metrics: self.report_db_metrics,
+        }
+    }
+}

@@ -18,11 +18,13 @@
 extern crate alloc;
 
 use crate::execute::{BasicBlockBuilder, Executor};
-use alloc::{string::String, vec::Vec};
+#[cfg(feature = "std")]
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use alloy_eips::eip4895::Withdrawals;
 use alloy_evm::{
     block::{BlockExecutorFactory, BlockExecutorFor},
-    precompiles::PrecompilesMap,
+    precompiles::{DynPrecompile, PrecompilesMap},
 };
 use alloy_primitives::{Address, Bytes, B256};
 use core::{error::Error, fmt::Debug};
@@ -31,11 +33,20 @@ use reth_execution_errors::BlockExecutionError;
 use reth_primitives_traits::{
     BlockTy, HeaderTy, NodePrimitives, ReceiptTy, SealedBlock, SealedHeader, TxTy,
 };
-use revm::{database::State, primitives::hardfork::SpecId};
+use revm::{
+    context::{result::ExecutionResult, TxEnv},
+    context_interface::result::HaltReason,
+    database::State,
+    primitives::hardfork::SpecId,
+};
 
 pub mod either;
 /// EVM environment configuration.
 pub mod execute;
+#[cfg(feature = "std")]
+pub mod parallel_execute;
+#[cfg(feature = "std")]
+use parallel_execute::ParallelExecutor;
 
 mod aliases;
 pub use aliases::*;
@@ -44,8 +55,6 @@ pub use aliases::*;
 mod engine;
 #[cfg(feature = "std")]
 pub use engine::{ConfigureEngineEvm, ConvertTx, ExecutableTxIterator, ExecutableTxTuple};
-mod sender_recovery;
-pub use sender_recovery::SenderRecoveryCache;
 
 #[cfg(feature = "metrics")]
 pub mod metrics;
@@ -58,6 +67,18 @@ pub use alloy_evm::{
     block::{state_changes, system_calls, OnStateHook},
     *,
 };
+
+pub use alloy_evm::block::state_changes as state_change;
+
+/// Database abstraction for parallel execution.
+pub trait ParallelDatabase:
+    revm::DatabaseRef<Error: Error + Send + Sync + 'static + Clone> + Send + Sync + Debug
+{
+}
+impl<T> ParallelDatabase for T where
+    T: revm::DatabaseRef<Error: Error + Send + Sync + 'static + Clone> + Send + Sync + Debug
+{
+}
 
 /// A complete configuration of EVM for Reth.
 ///
@@ -266,34 +287,6 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
         self.block_executor_factory().evm_factory()
     }
 
-    /// Returns a config with JIT support enabled for subsequently created EVMs, if supported.
-    ///
-    /// This is one of three gates required before an EVM can execute JIT-compiled code: the binary
-    /// must be built with the `jit` feature, runtime compilation must be enabled by `--jit` or the
-    /// `reth_jit` RPC method, and this local support flag must be enabled for the config that
-    /// creates the EVM.
-    #[auto_impl(keep_default_for(&, Arc))]
-    fn with_jit_support_enabled(self, _enabled: bool) -> Self
-    where
-        Self: Sized,
-    {
-        self
-    }
-
-    /// Returns a config with local JIT support enabled for subsequently created EVMs, if supported.
-    #[auto_impl(keep_default_for(&, Arc))]
-    fn with_jit_support(self) -> Self
-    where
-        Self: Sized,
-    {
-        self.with_jit_support_enabled(true)
-    }
-
-    /// Returns the JIT backend, if supported.
-    fn jit_backend(&self) -> Option<&dyn JitBackend> {
-        None
-    }
-
     /// Returns a new EVM with the given database configured with the given environment settings,
     /// including the spec id and transaction environment.
     ///
@@ -488,21 +481,28 @@ pub trait ConfigureEvm: Clone + Debug + Send + Sync + Unpin {
     ) -> impl Executor<DB, Primitives = Self::Primitives, Error = BlockExecutionError> {
         BasicBlockExecutor::new(self, db)
     }
-}
 
-/// JIT backend controls exposed by an EVM configuration.
-pub trait JitBackend: Send + Sync {
-    /// Enables or disables JIT compilation.
-    fn set_enabled(&self, enabled: bool) -> Result<(), String>;
+    /// Executes a single system transaction directly against the given database state and commits
+    /// the resulting state changes immediately.
+    ///
+    /// Default: `unimplemented!()` — override in every `ConfigureEvm` impl that supports system
+    /// transactions.
+    fn transact_system_txn<DB: Database>(
+        &self,
+        _db: &mut State<DB>,
+        _evm_env: EvmEnv,
+        _precompiles: Vec<(Address, DynPrecompile)>,
+        _tx_env: TxEnv,
+    ) -> Result<ExecutionResult<HaltReason>, BlockExecutionError> {
+        unimplemented!("transact_system_txn not implemented for this ConfigureEvm")
+    }
 
-    /// Pauses JIT helper execution while keeping queueing and resident compiled code available.
-    fn pause(&self);
-
-    /// Resumes background JIT work.
-    fn resume(&self);
-
-    /// Clears JIT runtime state.
-    fn clear(&self);
+    /// Returns a new [`ParallelExecutor`].
+    #[cfg(feature = "std")]
+    fn parallel_executor<'a, DB: ParallelDatabase + 'a>(
+        &self,
+        db: DB,
+    ) -> Box<dyn ParallelExecutor<Primitives = Self::Primitives, Error = BlockExecutionError> + 'a>;
 }
 
 /// Represents additional attributes required to configure the next block.

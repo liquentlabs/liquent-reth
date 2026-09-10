@@ -29,8 +29,4 @@ pub enum E2sError {
     /// Error during RLP encoding/decoding
     #[error("RLP error: {0}")]
     Rlp(String),
-
-    /// Error converting an execution payload into a block
-    #[error("execution payload error: {0}")]
-    ExecutionPayload(#[from] alloy_rpc_types_engine::PayloadError),
 }

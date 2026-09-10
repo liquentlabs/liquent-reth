@@ -8,15 +8,23 @@ use alloy_eips::{
     eip7002::{WITHDRAWAL_REQUEST_PREDEPLOY_ADDRESS, WITHDRAWAL_REQUEST_PREDEPLOY_CODE},
     eip7685::EMPTY_REQUESTS_HASH,
 };
-use alloy_evm::block::BlockValidationError;
-use alloy_primitives::{b256, fixed_bytes, keccak256, Bytes, TxKind, B256, U256};
+use alloy_evm::block::{BlockValidationError, NoopHook};
+use alloy_primitives::{address, b256, fixed_bytes, keccak256, Address, Bytes, TxKind, B256, U256};
 use reth_chainspec::{ChainSpecBuilder, EthereumHardfork, ForkCondition, MAINNET};
 use reth_ethereum_primitives::{Block, BlockBody, Transaction};
 use reth_evm::{
     execute::{BasicBlockExecutor, Executor},
+    parallel_execute::ParallelExecutor,
+    precompiles::{DynPrecompile, PrecompileInput},
     ConfigureEvm,
 };
-use reth_evm_ethereum::EthEvmConfig;
+use reth_evm_ethereum::{
+    parallel_execute::{
+        LiquentTxSkipReason, LiquentTxSkippedEvent, LevmExecutor, LIQUENT_TX_SKIPPED_LOG_ADDRESS,
+        LIQUENT_TX_SKIPPED_LOG_TOPIC0,
+    },
+    EthEvmConfig,
+};
 use reth_execution_types::BlockExecutionResult;
 use reth_primitives_traits::{
     crypto::secp256k1::public_key_to_address, Block as _, RecoveredBlock,
@@ -24,11 +32,15 @@ use reth_primitives_traits::{
 use reth_testing_utils::generators::{self, sign_tx_with_key_pair};
 use revm::{
     database::{CacheDB, EmptyDB, TransitionState},
-    primitives::address,
+    precompile::{PrecompileId, PrecompileOutput, PrecompileResult},
     state::{AccountInfo, Bytecode, EvmState},
     Database,
 };
 use std::sync::{mpsc, Arc};
+
+const CUSTOM_PRECOMPILE_ADDR: Address = address!("0000000000000000000000000000000000000999");
+const CUSTOM_PRECOMPILE_GAS: u64 = 777;
+const CUSTOM_PRECOMPILE_TX_GAS_USED: u64 = 21_000 + CUSTOM_PRECOMPILE_GAS;
 
 fn create_database_with_beacon_root_contract() -> CacheDB<EmptyDB> {
     let mut db = CacheDB::new(Default::default());
@@ -63,6 +75,155 @@ fn create_database_with_withdrawal_requests_contract() -> CacheDB<EmptyDB> {
     );
 
     db
+}
+
+fn create_custom_precompile() -> DynPrecompile {
+    (
+        PrecompileId::custom("test_custom_precompile"),
+        |_input: PrecompileInput<'_>| -> PrecompileResult {
+            Ok(PrecompileOutput::new(CUSTOM_PRECOMPILE_GAS, Bytes::from(vec![0x42; 64]), 0))
+        },
+    )
+        .into()
+}
+
+fn custom_precompile_call_block(
+    chain_spec: &reth_chainspec::ChainSpec,
+) -> (RecoveredBlock<Block>, Address) {
+    let sender_key_pair = generators::generate_key(&mut generators::rng());
+    let sender_address = public_key_to_address(sender_key_pair.public_key());
+    let mut header = chain_spec.genesis_header().clone();
+    header.gas_limit = 100_000;
+    header.gas_used = CUSTOM_PRECOMPILE_TX_GAS_USED;
+
+    let tx = sign_tx_with_key_pair(
+        sender_key_pair,
+        Transaction::Legacy(TxLegacy {
+            chain_id: Some(chain_spec.chain.id()),
+            nonce: 0,
+            gas_price: header.base_fee_per_gas.unwrap_or_default().into(),
+            gas_limit: header.gas_limit,
+            to: TxKind::Call(CUSTOM_PRECOMPILE_ADDR),
+            value: U256::ZERO,
+            input: Bytes::new(),
+        }),
+    );
+
+    (
+        Block { header, body: BlockBody { transactions: vec![tx], ..Default::default() } }
+            .try_into_recovered()
+            .unwrap(),
+        sender_address,
+    )
+}
+
+fn create_custom_precompile_executor_and_block(
+) -> (BasicBlockExecutor<EthEvmConfig, CacheDB<EmptyDB>>, RecoveredBlock<Block>) {
+    let chain_spec = Arc::new(ChainSpecBuilder::from(&*MAINNET).shanghai_activated().build());
+    let mut db = CacheDB::new(EmptyDB::default());
+
+    let (block, sender_address) = custom_precompile_call_block(&chain_spec);
+    db.insert_account_info(
+        sender_address,
+        AccountInfo { balance: U256::from(ETH_TO_WEI), ..Default::default() },
+    );
+
+    let provider = EthEvmConfig::new(chain_spec);
+    let mut executor = BasicBlockExecutor::new(provider, db);
+    executor.apply_custom_precompiles(Arc::new(vec![(
+        CUSTOM_PRECOMPILE_ADDR,
+        create_custom_precompile(),
+    )]));
+
+    (executor, block)
+}
+
+#[test]
+fn levm_executor_keeps_invalid_tx_in_block_with_skipped_receipt() {
+    let chain_spec = Arc::new(ChainSpecBuilder::from(&*MAINNET).shanghai_activated().build());
+    let sender_key_pair = generators::generate_key(&mut generators::rng());
+    let sender = public_key_to_address(sender_key_pair.public_key());
+
+    let make_tx = |nonce| {
+        sign_tx_with_key_pair(
+            sender_key_pair,
+            Transaction::Legacy(TxLegacy {
+                chain_id: Some(chain_spec.chain.id()),
+                nonce,
+                gas_price: 1,
+                gas_limit: 21_000,
+                to: TxKind::Call(sender),
+                value: U256::ZERO,
+                input: Bytes::new(),
+            }),
+        )
+    };
+
+    // tx1 repeats tx0's nonce and is skipped. tx2 proves the skipped transaction did not bump the
+    // sender nonce and execution continued with the next valid transaction.
+    let mut transactions = vec![make_tx(0), make_tx(0)];
+    transactions.extend((1..=62).map(make_tx));
+    let header =
+        Header { number: 1, gas_limit: 2_000_000, base_fee_per_gas: Some(1), ..Header::default() };
+    let block = Block { header, body: BlockBody { transactions, ..Default::default() } }
+        .try_into_recovered()
+        .unwrap();
+
+    let evm_config = EthEvmConfig::new(chain_spec.clone());
+
+    for force_sequential in [false, true] {
+        let mut db = CacheDB::new(EmptyDB::default());
+        db.insert_account_info(
+            sender,
+            AccountInfo { balance: U256::from(ETH_TO_WEI), ..Default::default() },
+        );
+        let mut executor = if force_sequential {
+            LevmExecutor::new_sequential(chain_spec.clone(), &evm_config, db)
+        } else {
+            LevmExecutor::new(chain_spec.clone(), &evm_config, db)
+        };
+
+        let result = executor.execute_one(&block).expect("invalid tx should be skipped");
+        assert_eq!(result.receipts.len(), 64);
+        assert!(result.receipts[0].success);
+        assert!(!result.receipts[1].success);
+        assert!(result.receipts[2..].iter().all(|receipt| receipt.success));
+        assert_eq!(result.receipts[0].cumulative_gas_used, 21_000);
+        assert_eq!(result.receipts[1].cumulative_gas_used, 21_000);
+        assert_eq!(result.receipts[2].cumulative_gas_used, 42_000);
+        assert_eq!(result.gas_used, 63 * 21_000);
+
+        let skipped_log = &result.receipts[1].logs[0];
+        assert_eq!(skipped_log.address, LIQUENT_TX_SKIPPED_LOG_ADDRESS);
+        assert_eq!(skipped_log.data.topics()[0], LIQUENT_TX_SKIPPED_LOG_TOPIC0);
+        assert_eq!(
+            LiquentTxSkippedEvent::decode(skipped_log),
+            Some(LiquentTxSkipReason::NonceTooLow)
+        );
+    }
+}
+
+#[test]
+fn basic_block_executor_execute_one_applies_custom_precompiles() {
+    let (mut executor, block) = create_custom_precompile_executor_and_block();
+
+    let BlockExecutionResult { receipts, .. } = executor.execute_one(&block).unwrap();
+
+    let receipt = receipts.first().expect("transaction should produce a receipt");
+    assert!(receipt.success);
+    assert_eq!(receipt.cumulative_gas_used, CUSTOM_PRECOMPILE_TX_GAS_USED);
+}
+
+#[test]
+fn basic_block_executor_execute_one_with_state_hook_applies_custom_precompiles() {
+    let (mut executor, block) = create_custom_precompile_executor_and_block();
+
+    let BlockExecutionResult { receipts, .. } =
+        executor.execute_one_with_state_hook(&block, NoopHook::default()).unwrap();
+
+    let receipt = receipts.first().expect("transaction should produce a receipt");
+    assert!(receipt.success);
+    assert_eq!(receipt.cumulative_gas_used, CUSTOM_PRECOMPILE_TX_GAS_USED);
 }
 
 #[test]
@@ -811,7 +972,7 @@ fn test_balance_increment_not_duplicated() {
     let tx_clone = tx.clone();
 
     let _output = executor
-        .execute_with_state_hook(block, move |state: EvmState| {
+        .execute_with_state_hook(block, move |state: &EvmState| {
             if let Some(account) = state.get(&withdrawal_recipient) {
                 let _ = tx_clone.send(account.info.balance);
             }

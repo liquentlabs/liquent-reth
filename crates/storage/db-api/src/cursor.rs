@@ -17,6 +17,11 @@ pub trait DbCursorRO<T: Table> {
     /// Seeks to the KV pair exactly at `key`.
     fn seek_exact(&mut self, key: T::Key) -> PairResult<T>;
 
+    /// Get the KV pair exactly at `key`.
+    fn get(&mut self, key: T::Key) -> PairResult<T> {
+        self.seek_exact(key)
+    }
+
     /// Seeks to the KV pair whose key is greater than or equal to `key`.
     fn seek(&mut self, key: T::Key) -> PairResult<T>;
 
@@ -62,14 +67,8 @@ pub trait DbCursorRO<T: Table> {
 
 /// A read-only cursor over the dup table `T`.
 pub trait DbDupCursorRO<T: DupSort> {
-    /// Positions the cursor at the prev KV pair of the table, returning it.
-    fn prev_dup(&mut self) -> PairResult<T>;
-
     /// Positions the cursor at the next KV pair of the table, returning it.
     fn next_dup(&mut self) -> PairResult<T>;
-
-    /// Positions the cursor at the last duplicate value of the current key.
-    fn last_dup(&mut self) -> ValueOnlyResult<T>;
 
     /// Positions the cursor at the next KV pair of the table, skipping duplicates.
     fn next_no_dup(&mut self) -> PairResult<T>;
@@ -85,6 +84,11 @@ pub trait DbDupCursorRO<T: DupSort> {
     /// exist.
     fn seek_by_key_subkey(&mut self, key: T::Key, subkey: T::SubKey) -> ValueOnlyResult<T>;
 
+    /// Get the KV pair exactly at `key` + `subkey`.
+    fn get_by_key_subkey(&mut self, key: T::Key, subkey: T::SubKey) -> ValueOnlyResult<T> {
+        self.seek_by_key_subkey(key, subkey)
+    }
+
     /// Get an iterator that walks through the dup table.
     ///
     /// The cursor will start at different points in the table depending on the values of `key` and
@@ -93,7 +97,7 @@ pub trait DbDupCursorRO<T: DupSort> {
     /// | `key`  | `subkey` | **Equivalent starting position**        |
     /// |--------|----------|-----------------------------------------|
     /// | `None` | `None`   | [`DbCursorRO::first()`]                 |
-    /// | `Some` | `None`   | [`DbCursorRO::seek_exact()`]            |
+    /// | `Some` | `None`   | [`DbCursorRO::seek()`]               |
     /// | `None` | `Some`   | [`DbDupCursorRO::seek_by_key_subkey()`] |
     /// | `Some` | `Some`   | [`DbDupCursorRO::seek_by_key_subkey()`] |
     fn walk_dup(
@@ -123,9 +127,14 @@ pub trait DbCursorRW<T: Table> {
 
     /// Delete current value that cursor points to
     fn delete_current(&mut self) -> Result<(), DatabaseError>;
+
+    /// Delete by key
+    fn delete_by_key(&mut self, _key: T::Key) -> Result<(), DatabaseError> {
+        unimplemented!("not support")
+    }
 }
 
-/// Read Write Cursor over `DupSort` table.
+/// Read Write Cursor over `DupSorted` table.
 pub trait DbDupCursorRW<T: DupSort> {
     /// Delete all duplicate entries for current key.
     fn delete_current_duplicates(&mut self) -> Result<(), DatabaseError>;
@@ -134,6 +143,15 @@ pub trait DbDupCursorRW<T: DupSort> {
     ///
     /// This is efficient for pre-sorted data. If the data is not pre-sorted, use `insert`.
     fn append_dup(&mut self, key: T::Key, value: T::Value) -> Result<(), DatabaseError>;
+
+    /// Delete by key and subkey
+    fn delete_by_key_subkey(
+        &mut self,
+        _key: T::Key,
+        _subkey: T::SubKey,
+    ) -> Result<(), DatabaseError> {
+        unimplemented!("not support")
+    }
 }
 
 /// Provides an iterator to `Cursor` when handling `Table`.
@@ -324,14 +342,6 @@ impl<T: Table, CURSOR: DbCursorRW<T> + DbCursorRO<T>> RangeWalker<'_, T, CURSOR>
     }
 }
 
-impl<T: DupSort, CURSOR: DbDupCursorRW<T> + DbCursorRO<T>> RangeWalker<'_, T, CURSOR> {
-    /// Delete all duplicate entries for current key that walker points to.
-    pub fn delete_current_duplicates(&mut self) -> Result<(), DatabaseError> {
-        self.start.take();
-        self.cursor.delete_current_duplicates()
-    }
-}
-
 /// Provides an iterator to `Cursor` when handling a `DupSort` table.
 ///
 /// Reason why we have two lifetimes is to distinguish between `'cursor` lifetime
@@ -342,6 +352,8 @@ pub struct DupWalker<'cursor, T: DupSort, CURSOR: DbDupCursorRO<T>> {
     pub cursor: &'cursor mut CURSOR,
     /// Value where to start the walk.
     pub start: IterPairResult<T>,
+    /// Flag indicating the iterator is done (key not found or exhausted).
+    pub is_done: bool,
 }
 
 impl<T, CURSOR> fmt::Debug for DupWalker<'_, T, CURSOR>
@@ -353,6 +365,7 @@ where
         f.debug_struct("DupWalker")
             .field("cursor", &self.cursor)
             .field("start", &self.start)
+            .field("is_done", &self.is_done)
             .finish()
     }
 }
@@ -368,6 +381,9 @@ impl<T: DupSort, CURSOR: DbCursorRW<T> + DbDupCursorRO<T>> DupWalker<'_, T, CURS
 impl<T: DupSort, CURSOR: DbDupCursorRO<T>> Iterator for DupWalker<'_, T, CURSOR> {
     type Item = Result<TableRow<T>, DatabaseError>;
     fn next(&mut self) -> Option<Self::Item> {
+        if self.is_done {
+            return None
+        }
         let start = self.start.take();
         if start.is_some() {
             return start

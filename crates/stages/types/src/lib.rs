@@ -18,7 +18,7 @@ pub use id::StageId;
 mod checkpoints;
 pub use checkpoints::{
     AccountHashingCheckpoint, CheckpointBlockRange, EntitiesCheckpoint, ExecutionCheckpoint,
-    FinishCheckpoint, HeadersCheckpoint, IndexHistoryCheckpoint, MerkleCheckpoint, StageCheckpoint,
+    HeadersCheckpoint, IndexHistoryCheckpoint, MerkleCheckpoint, StageCheckpoint,
     StageUnitCheckpoint, StorageHashingCheckpoint, StorageRootMerkleCheckpoint,
 };
 

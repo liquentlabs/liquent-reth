@@ -258,13 +258,6 @@ pub(crate) fn streaming_download_and_extract(
     target_dir: &Path,
     session: &DownloadSession,
 ) -> Result<()> {
-    if let Some(path) = archive_file_url_path(url)? {
-        let size = path.metadata()?.len();
-        extract_from_file(&path, format, target_dir)?;
-        session.record_archive_output_complete(size);
-        return Ok(())
-    }
-
     let shared = session.progress();
     let quiet = session.progress().is_some();
     let mut last_error: Option<eyre::Error> = None;
@@ -300,9 +293,7 @@ pub(crate) fn streaming_download_and_extract(
                 }
                 last_error = Some(err);
                 if attempt < MAX_DOWNLOAD_RETRIES {
-                    std::thread::sleep(
-                        session.retry_delay(Duration::from_secs(RETRY_BACKOFF_SECS)),
-                    );
+                    std::thread::sleep(Duration::from_secs(RETRY_BACKOFF_SECS));
                 }
                 continue;
             }
@@ -344,9 +335,7 @@ pub(crate) fn streaming_download_and_extract(
                 }
                 last_error = Some(error);
                 if attempt < MAX_DOWNLOAD_RETRIES {
-                    std::thread::sleep(
-                        session.retry_delay(Duration::from_secs(RETRY_BACKOFF_SECS)),
-                    );
+                    std::thread::sleep(Duration::from_secs(RETRY_BACKOFF_SECS));
                 }
             }
         }
@@ -355,19 +344,6 @@ pub(crate) fn streaming_download_and_extract(
     Err(last_error.unwrap_or_else(|| {
         eyre::eyre!("Streaming download failed after {MAX_DOWNLOAD_RETRIES} attempts")
     }))
-}
-
-/// Resolves a `file://` archive URL to its local path.
-fn archive_file_url_path(url: &str) -> Result<Option<PathBuf>> {
-    let Ok(parsed) = Url::parse(url) else { return Ok(None) };
-    if parsed.scheme() != "file" {
-        return Ok(None)
-    }
-
-    parsed
-        .to_file_path()
-        .map(Some)
-        .map_err(|_| eyre::eyre!("Invalid file:// archive URL path: {url}"))
 }
 
 /// Fetches the snapshot from a remote URL with resume support, then extracts it.
@@ -421,15 +397,13 @@ fn blocking_download_and_extract(
     resumable: bool,
     request_limiter: Option<Arc<DownloadRequestLimiter>>,
     cancel_token: CancellationToken,
-    retry_backoff: Option<Duration>,
 ) -> Result<()> {
     let format = CompressionFormat::from_url(url)?;
 
     if let Ok(parsed_url) = Url::parse(url) &&
         parsed_url.scheme() == "file"
     {
-        let session = DownloadSession::new(shared, request_limiter, cancel_token)
-            .with_retry_backoff(retry_backoff);
+        let session = DownloadSession::new(shared, request_limiter, cancel_token);
         let file_path = parsed_url
             .to_file_path()
             .map_err(|_| eyre::eyre!("Invalid file:// URL path: {}", url))?;
@@ -443,17 +417,14 @@ fn blocking_download_and_extract(
             url,
             format,
             target_dir,
-            DownloadSession::new(shared, Some(request_limiter), cancel_token)
-                .with_retry_backoff(retry_backoff),
+            DownloadSession::new(shared, Some(request_limiter), cancel_token),
         )
     } else if resumable {
         let session =
-            DownloadSession::new(shared, Some(DownloadRequestLimiter::new(1)), cancel_token)
-                .with_retry_backoff(retry_backoff);
+            DownloadSession::new(shared, Some(DownloadRequestLimiter::new(1)), cancel_token);
         download_and_extract(url, format, target_dir, session)
     } else {
-        let session =
-            DownloadSession::new(shared, None, cancel_token).with_retry_backoff(retry_backoff);
+        let session = DownloadSession::new(shared, None, cancel_token);
         let result = streaming_download_and_extract(url, format, target_dir, &session);
         if result.is_ok() {
             session.record_archive_output_complete(0);
@@ -474,7 +445,6 @@ pub(crate) async fn stream_and_extract(
     resumable: bool,
     request_limiter: Option<Arc<DownloadRequestLimiter>>,
     cancel_token: CancellationToken,
-    retry_backoff: Option<Duration>,
 ) -> Result<()> {
     let target_dir = target_dir.to_path_buf();
     let url = url.to_string();
@@ -486,7 +456,6 @@ pub(crate) async fn stream_and_extract(
             resumable,
             request_limiter,
             cancel_token,
-            retry_backoff,
         )
     })
     .await??;

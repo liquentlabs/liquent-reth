@@ -5,23 +5,16 @@
 
 extern crate alloc;
 
-#[cfg(feature = "std")]
 mod state;
-#[cfg(feature = "std")]
 pub use state::*;
 
-#[cfg(feature = "std")]
 mod trie;
-#[cfg(feature = "std")]
 pub use trie::*;
 
 mod traits;
 pub use traits::*;
 
-#[cfg(feature = "std")]
-mod arena;
-#[cfg(feature = "std")]
-pub use arena::*;
+pub mod provider;
 
 #[cfg(feature = "metrics")]
 mod metrics;

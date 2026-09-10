@@ -160,7 +160,7 @@ enum Subcommands {
 
 impl Subcommands {
     /// Returns the block to unwind to. The returned block will stay in database.
-    fn unwind_target<N: ProviderNodeTypes<DB = DatabaseEnv>>(
+    fn unwind_target<N: ProviderNodeTypes<DB = Arc<DatabaseEnv>>>(
         &self,
         factory: ProviderFactory<N>,
     ) -> eyre::Result<u64> {
@@ -178,7 +178,7 @@ impl Subcommands {
         if target > last {
             eyre::bail!(
                 "Target block number {target} is higher than the latest block number {last}"
-            );
+            )
         }
         Ok(target)
     }

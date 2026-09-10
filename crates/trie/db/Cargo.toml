@@ -13,19 +13,24 @@ workspace = true
 
 [dependencies]
 # reth
-reth-primitives-traits = { workspace = true, features = ["std"] }
+reth-primitives-traits.workspace = true
 reth-execution-errors.workspace = true
 reth-db-api.workspace = true
-reth-trie.workspace = true
-reth-trie-common.workspace = true
-reth-storage-api = { workspace = true, features = ["db-api"] }
+reth-storage-api = { workspace = true, features = ["std"] }
 reth-storage-errors.workspace = true
+reth-trie.workspace = true
 
 # alloy
 alloy-primitives.workspace = true
+alloy-rlp.workspace = true
 
 # tracing
 tracing.workspace = true
+
+# misc
+once_cell.workspace = true
+parking_lot.workspace = true
+rayon.workspace = true
 
 [dev-dependencies]
 # reth
@@ -33,13 +38,13 @@ reth-chainspec.workspace = true
 reth-primitives-traits = { workspace = true, features = ["test-utils", "arbitrary"] }
 reth-db = { workspace = true, features = ["test-utils"] }
 reth-provider = { workspace = true, features = ["test-utils"] }
-reth-stages-types.workspace = true
 reth-trie-common = { workspace = true, features = ["test-utils", "arbitrary"] }
 reth-trie = { workspace = true, features = ["test-utils"] }
 
 alloy-consensus.workspace = true
 alloy-rlp.workspace = true
 revm.workspace = true
+revm-database.workspace = true
 
 # trie
 triehash.workspace = true
@@ -49,6 +54,7 @@ proptest.workspace = true
 proptest-arbitrary-interop.workspace = true
 serde_json.workspace = true
 similar-asserts.workspace = true
+rand.workspace = true
 
 [features]
 metrics = ["reth-trie/metrics"]
@@ -56,12 +62,14 @@ serde = [
     "similar-asserts/serde",
     "alloy-consensus/serde",
     "alloy-primitives/serde",
+    "parking_lot/serde",
+    "rand/serde",
     "reth-storage-api/serde",
     "reth-trie/serde",
     "reth-trie-common/serde",
     "reth-primitives-traits/serde",
+    "revm-database/serde",
     "revm/serde",
-    "reth-stages-types/serde",
 ]
 test-utils = [
     "reth-trie-common/test-utils",
@@ -71,5 +79,4 @@ test-utils = [
     "reth-db-api/test-utils",
     "reth-provider/test-utils",
     "reth-trie/test-utils",
-    "reth-stages-types/test-utils",
 ]

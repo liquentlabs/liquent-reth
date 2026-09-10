@@ -11,6 +11,7 @@ use reth_cli::chainspec::ChainSpecParser;
 use reth_cli_runner::CliContext;
 use reth_cli_util::get_secret_key;
 use reth_config::config::{HashingConfig, SenderRecoveryConfig, TransactionLookupConfig};
+use reth_db_api::database_metrics::DatabaseMetrics;
 use reth_downloaders::{
     bodies::bodies::BodiesDownloaderBuilder,
     headers::reverse_headers::ReverseHeadersDownloaderBuilder,
@@ -18,20 +19,19 @@ use reth_downloaders::{
 use reth_exex::ExExManagerHandle;
 use reth_network::BlockDownloaderProvider;
 use reth_network_p2p::HeadersClient;
-use reth_node_builder::common::metrics_hooks;
 use reth_node_core::{
     args::{NetworkArgs, StageEnum},
     version::version_metadata,
 };
 use reth_node_metrics::{
     chain::ChainSpecInfo,
+    hooks::Hooks,
     server::{MetricServer, MetricServerConfig},
     version::VersionInfo,
 };
-use reth_primitives_traits::FastInstant as Instant;
 use reth_provider::{
-    providers::BlockchainProvider, ChainSpecProvider, DBProvider, DatabaseProviderFactory,
-    StageCheckpointReader, StageCheckpointWriter,
+    writer::UnifiedStorageWriter, ChainSpecProvider, DatabaseProviderFactory,
+    StageCheckpointReader, StageCheckpointWriter, StaticFileProviderFactory,
 };
 use reth_stages::{
     stages::{
@@ -41,7 +41,7 @@ use reth_stages::{
     },
     ExecInput, ExecOutput, ExecutionStageThresholds, Stage, StageExt, UnwindInput, UnwindOutput,
 };
-use std::{any::Any, net::SocketAddr, sync::Arc};
+use std::{any::Any, net::SocketAddr, sync::Arc, time::Instant};
 use tokio::sync::watch;
 use tracing::*;
 
@@ -140,7 +140,20 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
                 },
                 ChainSpecInfo { name: provider_factory.chain_spec().chain().to_string() },
                 ctx.task_executor,
-                metrics_hooks(&provider_factory),
+                Hooks::builder()
+                    .with_hook({
+                        let db = provider_factory.db_ref().clone();
+                        move || db.report_metrics()
+                    })
+                    .with_hook({
+                        let sfp = provider_factory.static_file_provider();
+                        move || {
+                            if let Err(error) = sfp.report_metrics() {
+                                error!(%error, "Failed to report metrics from static file provider");
+                            }
+                        }
+                    })
+                    .build(),
                 data_dir.pprof_dumps(),
             );
 
@@ -175,7 +188,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
                             default_peers_path,
                             runtime.clone(),
                         )
-                        .build(BlockchainProvider::new(provider_factory.clone())?)
+                        .build(provider_factory.clone())
                         .start_network()
                         .await?;
                     let fetch_client = Arc::new(network.fetch_client().await?);
@@ -231,7 +244,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
                             default_peers_path,
                             runtime.clone(),
                         )
-                        .build(BlockchainProvider::new(provider_factory.clone())?)
+                        .build(provider_factory.clone())
                         .start_network()
                         .await?;
                     let fetch_client = Arc::new(network.fetch_client().await?);
@@ -352,7 +365,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
                 }
 
                 if self.commit {
-                    provider_rw.commit()?;
+                    UnifiedStorageWriter::commit_unwind(provider_rw)?;
                     provider_rw = provider_factory.database_provider_rw()?;
                 }
             }
@@ -375,7 +388,7 @@ impl<C: ChainSpecParser<ChainSpec: EthChainSpec + Hardforks + EthereumHardforks>
                 provider_rw.save_stage_checkpoint(exec_stage.id(), checkpoint)?;
             }
             if self.commit {
-                provider_rw.commit()?;
+                UnifiedStorageWriter::commit(provider_rw)?;
                 provider_rw = provider_factory.database_provider_rw()?;
             }
 

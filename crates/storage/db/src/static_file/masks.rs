@@ -1,10 +1,10 @@
 use crate::{
     add_static_file_mask,
     static_file::mask::{ColumnSelectorOne, ColumnSelectorTwo},
-    HeaderTerminalDifficulties,
+    AccountChangeSets, HeaderTerminalDifficulties,
 };
-use alloy_primitives::{Address, BlockHash};
-use reth_db_api::{models::StorageBeforeTx, table::Table, AccountChangeSets};
+use alloy_primitives::BlockHash;
+use reth_db_api::{models::StorageBeforeTx, table::Table};
 
 // HEADER MASKS
 add_static_file_mask! {
@@ -33,20 +33,14 @@ add_static_file_mask! {
 
 // RECEIPT MASKS
 add_static_file_mask! {
-    #[doc = "Mask for selecting a single receipt from `Receipts` static file segment"]
+    #[doc = "Mask for selecting a single receipt from Receipts static file segment"]
     ReceiptMask<R>, R, 0b1
 }
 
 // TRANSACTION MASKS
 add_static_file_mask! {
-    #[doc = "Mask for selecting a single transaction from `Transactions` static file segment"]
+    #[doc = "Mask for selecting a single transaction from Transactions static file segment"]
     TransactionMask<T>, T, 0b1
-}
-
-// TRANSACTION SENDER MASKS
-add_static_file_mask! {
-    #[doc = "Mask for selecting a single transaction sender from `TransactionSenders` static file segment"]
-    TransactionSenderMask, Address, 0b1
 }
 
 // ACCOUNT CHANGESET MASKS

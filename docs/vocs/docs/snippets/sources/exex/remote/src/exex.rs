@@ -74,7 +74,7 @@ fn main() -> eyre::Result<()> {
 
         let handle = builder
             .node(EthereumNode::default())
-            .install_exex("remote-exex", async move |ctx| { Ok(remote_exex(ctx, notifications)) })
+            .install_exex("remote-exex", async move |ctx| Ok(remote_exex(ctx, notifications)))
             .launch_with_debug_capabilities()
             .await?;
 

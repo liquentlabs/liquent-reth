@@ -5,6 +5,16 @@ use alloy_primitives::b256;
 /// Gas per transaction not creating a contract.
 pub const MIN_TRANSACTION_GAS: u64 = 21_000u64;
 
+/// Reference value for the Liquent protocol minimum base fee per gas (50 Gwei).
+///
+/// The actual floor enforced at runtime is read from the chainspec field
+/// [`crate::ChainSpec::liquent_min_base_fee`] (parsed from genesis JSON
+/// `config.liquentMinBaseFee`), so non-Liquent chainspecs (e.g. Ethereum mainnet during
+/// reth history sync) keep upstream EIP-1559 semantics. This constant is kept for
+/// documentation, tests, and as the canonical reference value when constructing
+/// Liquent genesis files.
+pub const LIQUENT_MIN_BASE_FEE: u64 = 50_000_000_000;
+
 /// Mainnet prune delete limit.
 pub const MAINNET_PRUNE_DELETE_LIMIT: usize = 20000;
 
